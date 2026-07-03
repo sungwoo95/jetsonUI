@@ -1,0 +1,29 @@
+# Visual Studio
+.vs/
+Debug/
+Release/
+x64/
+x86/
+*.vcxproj.user
+*.aps
+*.sln.docstates
+
+# Build outputs
+*.obj
+*.exe
+*.pdb
+*.lib
+*.dll
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated files
+*.log
+*.ilk
+*.exp
