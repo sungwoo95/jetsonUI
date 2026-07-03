@@ -11,6 +11,7 @@
 #include "framework.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <algorithm>	// std::min/std::max (OpenCV 헤더가 min/max 매크로를 제거함)
 #pragma comment(lib, "ws2_32.lib")
 
 #endif //PCH_H

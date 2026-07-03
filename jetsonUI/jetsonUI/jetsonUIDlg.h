@@ -26,9 +26,13 @@ struct ReceivedFrame
 	double cudaMs = 0.0;        // CUDA 커널 (ms)
 	double d2hMs = 0.0;         // Device -> Host 복사 (ms)
 	double totalMs = 0.0;       // GPU 파이프라인 전체 (ms)
+	UINT32 format = 0;          // 0=Raw8, 1=Jpeg
+	double encodeMs = 0.0;      // 젯슨 JPEG 인코딩 (ms)
+	UINT32 payloadBytes = 0;    // 실제 전송된 페이로드 크기
 
 	// PC 측 측정 시간
 	double transferMs = 0.0;    // 픽셀 데이터 수신(네트워크 전송) (ms)
+	double decodeMs = 0.0;      // JPEG 디코딩 (ms)
 	double copyMs = 0.0;        // DIB 정렬 버퍼 복사 (ms)
 };
 

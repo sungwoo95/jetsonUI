@@ -8,18 +8,23 @@
 #include "jetsonUIDlg.h"
 #include "afxdialogex.h"
 
+#include <opencv2/imgcodecs.hpp>
+
 #ifdef _DEBUG
 #define new DEBUG_NEW
 #endif
 
 namespace
 {
-	// 젯슨 tcp_server.cpp::sendImage 프로토콜과 동일 (little-endian, 68바이트)
+	// 젯슨 tcp_server.cpp::sendFrame 프로토콜과 동일 (little-endian, 84바이트)
 	// [uint32 width][uint32 height][uint64 frameNumber][uint32 payloadBytes]
 	// [uint64 captureUs][uint64 serviceTotalUs]
 	// [double h2dMs][double cudaMs][double d2hMs][double totalMs]
-	constexpr int kHeaderBytes = 68;
+	// [uint32 format][uint32 reserved][double encodeMs]
+	constexpr int kHeaderBytes = 84;
 	constexpr UINT32 kMaxPayloadBytes = 100 * 1024 * 1024;
+	constexpr UINT32 kFormatRaw8 = 0;
+	constexpr UINT32 kFormatJpeg = 1;
 
 	constexpr UINT WM_APP_FRAME_RECEIVED = WM_APP + 1;
 	constexpr UINT WM_APP_STATUS = WM_APP + 2;
@@ -29,13 +34,13 @@ namespace
 
 	// 오른쪽 정보 열(파이프라인 + 로그) 레이아웃
 	constexpr int kSideColumnMinWidth = 230;
-	constexpr int kPipelineHeight = 170;	// 파이프라인 리스트 높이 (7항목 + 여유)
+	constexpr int kPipelineHeight = 215;	// 파이프라인 리스트 높이 (9항목 + 여유)
 
 	// 오른쪽 열의 시작 x 좌표 (이미지와 정보 열의 경계)
 	int sideColumnLeft(int clientWidth)
 	{
-		int sideWidth = max(kSideColumnMinWidth, (clientWidth * 35) / 100);
-		return max(0, clientWidth - sideWidth);
+		int sideWidth = std::max(kSideColumnMinWidth, (clientWidth * 35) / 100);
+		return std::max(0, clientWidth - sideWidth);
 	}
 
 	double elapsedMs(std::chrono::steady_clock::time_point begin)
@@ -54,6 +59,27 @@ namespace
 				return false;
 			}
 			received += chunk;
+		}
+		return true;
+	}
+
+	// JPEG을 8bit grayscale(행 4바이트 정렬) 버퍼로 디코딩 (OpenCV cv::imdecode)
+	// IMREAD_GRAYSCALE로 libjpeg-turbo(SIMD) 경로를 사용하며, DIB stride에 맞춰 행 단위 복사.
+	bool decodeJpegToGray(const BYTE* data, UINT32 bytes, UINT32 width, UINT32 height,
+		int strideBytes, std::vector<BYTE>& out)
+	{
+		// 입력 버퍼를 복사 없이 감싸는 1xN Mat (imdecode가 내부적으로 파싱)
+		cv::Mat encoded(1, static_cast<int>(bytes), CV_8UC1, const_cast<BYTE*>(data));
+		cv::Mat gray = cv::imdecode(encoded, cv::IMREAD_GRAYSCALE);
+		if (gray.empty() || gray.cols != static_cast<int>(width) || gray.rows != static_cast<int>(height))
+		{
+			return false;
+		}
+
+		out.resize(static_cast<size_t>(strideBytes) * height);
+		for (UINT32 y = 0; y < height; ++y)
+		{
+			memcpy(out.data() + static_cast<size_t>(y) * strideBytes, gray.ptr(y), width);
 		}
 		return true;
 	}
@@ -230,7 +256,7 @@ void CjetsonUIDlg::OnSize(UINT nType, int cx, int cy)
 	{
 		int left = sideColumnLeft(cx) + 5;
 		int top = kToolbarHeight + 5;
-		int pipelineBottom = min(top + kPipelineHeight, cy - 40);
+		int pipelineBottom = std::min(top + kPipelineHeight, cy - 40);
 
 		m_pipelineList.SetWindowPos(nullptr, left, top, cx - left - 5, pipelineBottom - top, SWP_NOZORDER);
 		m_logList.SetWindowPos(nullptr, left, pipelineBottom + 5, cx - left - 5, cy - pipelineBottom - 10, SWP_NOZORDER);
@@ -330,9 +356,9 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 			break;
 		}
 
-		UINT32 width, height, payloadBytes;
+		UINT32 width, height, payloadBytes, format;
 		UINT64 frameNumber, captureUs, serviceTotalUs;
-		double h2dMs, cudaMs, d2hMs, totalMs;
+		double h2dMs, cudaMs, d2hMs, totalMs, encodeMs;
 		memcpy(&width, header + 0, 4);
 		memcpy(&height, header + 4, 4);
 		memcpy(&frameNumber, header + 8, 8);
@@ -343,10 +369,15 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 		memcpy(&cudaMs, header + 44, 8);
 		memcpy(&d2hMs, header + 52, 8);
 		memcpy(&totalMs, header + 60, 8);
+		memcpy(&format, header + 68, 4);
+		memcpy(&encodeMs, header + 76, 8);
 
-		if (width == 0 || height == 0 || payloadBytes != width * height || payloadBytes > kMaxPayloadBytes)
+		bool validPayload = (format == kFormatRaw8)
+			? (payloadBytes == width * height)
+			: (format == kFormatJpeg && payloadBytes > 0);
+		if (width == 0 || height == 0 || !validPayload || payloadBytes > kMaxPayloadBytes)
 		{
-			msg.Format(_T("[Error] Invalid header (w=%u h=%u payload=%u). Disconnecting."), width, height, payloadBytes);
+			msg.Format(_T("[Error] Invalid header (w=%u h=%u fmt=%u payload=%u). Disconnecting."), width, height, format, payloadBytes);
 			postStatus(msg);
 			postLog(msg);
 			break;
@@ -384,16 +415,37 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 		frame->cudaMs = cudaMs;
 		frame->d2hMs = d2hMs;
 		frame->totalMs = totalMs;
+		frame->format = format;
+		frame->encodeMs = (format == kFormatJpeg) ? encodeMs : 0.0;
+		frame->payloadBytes = payloadBytes;
 		frame->transferMs = transferMs;
 		frame->strideBytes = (width + 3) & ~3u;
-		auto copyBegin = std::chrono::steady_clock::now();
-		frame->pixels.resize(static_cast<size_t>(frame->strideBytes) * height);
-		for (UINT32 y = 0; y < height; ++y)
+
+		if (format == kFormatJpeg)
 		{
-			memcpy(frame->pixels.data() + static_cast<size_t>(y) * frame->strideBytes,
-				raw.data() + static_cast<size_t>(y) * width, width);
+			// JPEG 디코딩 (수신 스레드에서 수행해 UI 스레드 부하 방지)
+			auto decodeBegin = std::chrono::steady_clock::now();
+			if (!decodeJpegToGray(raw.data(), payloadBytes, width, height,
+				frame->strideBytes, frame->pixels))
+			{
+				msg.Format(_T("[Error] JPEG decode failed for frame #%llu (%u bytes). Skipping."), frameNumber, payloadBytes);
+				postLog(msg);
+				delete frame;
+				continue;
+			}
+			frame->decodeMs = elapsedMs(decodeBegin);
 		}
-		frame->copyMs = elapsedMs(copyBegin);
+		else
+		{
+			auto copyBegin = std::chrono::steady_clock::now();
+			frame->pixels.resize(static_cast<size_t>(frame->strideBytes) * height);
+			for (UINT32 y = 0; y < height; ++y)
+			{
+				memcpy(frame->pixels.data() + static_cast<size_t>(y) * frame->strideBytes,
+					raw.data() + static_cast<size_t>(y) * width, width);
+			}
+			frame->copyMs = elapsedMs(copyBegin);
+		}
 
 		PostMessage(WM_APP_FRAME_RECEIVED, 0, reinterpret_cast<LPARAM>(frame));
 	}
@@ -430,11 +482,12 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 
 	// 프레임별 타이밍 로그
 	CString log;
-	log.Format(_T("[Frame #%llu] capture=%.1fms h2d=%.2fms cuda=%.2fms d2h=%.2fms transfer=%.1fms"),
+	log.Format(_T("[Frame #%llu] %s %u bytes | capture=%.1fms encode=%.1fms transfer=%.1fms decode=%.1fms"),
 		m_frame.frameNumber,
+		(m_frame.format == kFormatJpeg) ? _T("JPEG") : _T("RAW"),
+		m_frame.payloadBytes,
 		m_frame.captureUs / 1000.0,
-		m_frame.h2dMs, m_frame.cudaMs, m_frame.d2hMs,
-		m_frame.transferMs);
+		m_frame.encodeMs, m_frame.transferMs, m_frame.decodeMs);
 	m_logList.AddString(log);
 	m_logList.SetTopIndex(m_logList.GetCount() - 1);
 
@@ -454,20 +507,23 @@ void CjetsonUIDlg::updateTimingDisplay()
 	// 캡처->렌더링 전체 시간: 두 장비의 시계는 동기화되어 있지 않으므로
 	// 타임스탬프 비교 대신 각 구간 측정치를 더해 근사
 	// (serviceTotal = Capture + GPU 파이프라인 전체를 포함)
-	double e2eMs = m_frame.serviceTotalUs / 1000.0 + m_frame.transferMs + m_frame.copyMs + m_lastRenderMs;
+	double e2eMs = m_frame.serviceTotalUs / 1000.0 + m_frame.encodeMs
+		+ m_frame.transferMs + m_frame.decodeMs + m_frame.copyMs + m_lastRenderMs;
 
-	CString items[7];
+	CString items[9];
 	items[0].Format(_T("Capture    %8.1f ms"), m_frame.captureUs / 1000.0);
 	items[1].Format(_T("H2D        %8.2f ms"), m_frame.h2dMs);
 	items[2].Format(_T("CUDA       %8.2f ms"), m_frame.cudaMs);
 	items[3].Format(_T("D2H        %8.2f ms"), m_frame.d2hMs);
-	items[4].Format(_T("Transfer   %8.1f ms"), m_frame.transferMs);
-	items[5].Format(_T("Render     %8.2f ms"), m_lastRenderMs);
-	items[6].Format(_T("E2E        %8.1f ms"), e2eMs);
+	items[4].Format(_T("Encode     %8.2f ms"), m_frame.encodeMs);
+	items[5].Format(_T("Transfer   %8.1f ms"), m_frame.transferMs);
+	items[6].Format(_T("Decode     %8.2f ms"), m_frame.decodeMs);
+	items[7].Format(_T("Render     %8.2f ms"), m_lastRenderMs);
+	items[8].Format(_T("E2E        %8.1f ms"), e2eMs);
 
 	m_pipelineList.SetRedraw(FALSE);
 	m_pipelineList.ResetContent();
-	for (int i = 0; i < 7; ++i)
+	for (int i = 0; i < 9; ++i)
 	{
 		m_pipelineList.AddString(items[i]);
 	}
@@ -534,11 +590,11 @@ void CjetsonUIDlg::drawFrame(CDC& dc, const CRect& area)
 	}
 
 	// 종횡비를 유지하며 영역에 맞춤
-	double scale = min(
+	double scale = std::min(
 		static_cast<double>(area.Width()) / m_frame.width,
 		static_cast<double>(area.Height()) / m_frame.height);
-	int destW = max(1, static_cast<int>(m_frame.width * scale));
-	int destH = max(1, static_cast<int>(m_frame.height * scale));
+	int destW = std::max(1, static_cast<int>(m_frame.width * scale));
+	int destH = std::max(1, static_cast<int>(m_frame.height * scale));
 	int destX = area.left + (area.Width() - destW) / 2;
 	int destY = area.top + (area.Height() - destH) / 2;
 
