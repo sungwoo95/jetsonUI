@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -17,6 +18,18 @@ struct ReceivedFrame
 	UINT64 frameNumber = 0;
 	int strideBytes = 0;
 	std::vector<BYTE> pixels;
+
+	// 젯슨 파이프라인 단계별 소요 시간 (헤더로 수신)
+	UINT64 captureUs = 0;       // 카메라 캡처 (us)
+	UINT64 serviceTotalUs = 0;  // 캡처+GPU 처리 전체 (us)
+	double h2dMs = 0.0;         // Host -> Device 복사 (ms)
+	double cudaMs = 0.0;        // CUDA 커널 (ms)
+	double d2hMs = 0.0;         // Device -> Host 복사 (ms)
+	double totalMs = 0.0;       // GPU 파이프라인 전체 (ms)
+
+	// PC 측 측정 시간
+	double transferMs = 0.0;    // 픽셀 데이터 수신(네트워크 전송) (ms)
+	double copyMs = 0.0;        // DIB 정렬 버퍼 복사 (ms)
 };
 
 // CjetsonUIDlg 대화 상자
@@ -47,12 +60,17 @@ protected:
 		IDC_BTN_CONNECT,
 		IDC_STATUS_TEXT,
 		IDC_LOG_LIST,
+		IDC_PIPELINE_LIST,
 	};
 	CEdit m_hostEdit;
 	CEdit m_portEdit;
 	CButton m_connectButton;
 	CStatic m_statusText;
 	CListBox m_logList;
+	CListBox m_pipelineList;	// 이미지 오른쪽: 파이프라인 단계별 시간
+
+	// 마지막 렌더링(StretchDIBits) 소요 시간 (UI 스레드에서만 접근)
+	double m_lastRenderMs = 0.0;
 
 	// 수신 스레드 상태
 	std::thread m_recvThread;
@@ -68,6 +86,7 @@ protected:
 	void postLog(const CString& text);
 	void joinReceiveThread();
 	void drawFrame(CDC& dc, const CRect& area);
+	void updateTimingDisplay();
 
 	virtual void OnOK() {}	// Enter 키로 대화 상자가 닫히지 않도록 함
 

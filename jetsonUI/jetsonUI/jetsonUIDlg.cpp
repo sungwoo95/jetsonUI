@@ -14,9 +14,11 @@
 
 namespace
 {
-	// 젯슨 tcp_server.cpp::sendImage 프로토콜과 동일 (little-endian)
-	// uint32 width, uint32 height, uint64 frameNumber, uint32 payloadBytes
-	constexpr int kHeaderBytes = 20;
+	// 젯슨 tcp_server.cpp::sendImage 프로토콜과 동일 (little-endian, 68바이트)
+	// [uint32 width][uint32 height][uint64 frameNumber][uint32 payloadBytes]
+	// [uint64 captureUs][uint64 serviceTotalUs]
+	// [double h2dMs][double cudaMs][double d2hMs][double totalMs]
+	constexpr int kHeaderBytes = 68;
 	constexpr UINT32 kMaxPayloadBytes = 100 * 1024 * 1024;
 
 	constexpr UINT WM_APP_FRAME_RECEIVED = WM_APP + 1;
@@ -24,6 +26,22 @@ namespace
 
 	// 상단 컨트롤 영역 높이 (픽셀)
 	constexpr int kToolbarHeight = 40;
+
+	// 오른쪽 정보 열(파이프라인 + 로그) 레이아웃
+	constexpr int kSideColumnMinWidth = 230;
+	constexpr int kPipelineHeight = 170;	// 파이프라인 리스트 높이 (7항목 + 여유)
+
+	// 오른쪽 열의 시작 x 좌표 (이미지와 정보 열의 경계)
+	int sideColumnLeft(int clientWidth)
+	{
+		int sideWidth = max(kSideColumnMinWidth, (clientWidth * 35) / 100);
+		return max(0, clientWidth - sideWidth);
+	}
+
+	double elapsedMs(std::chrono::steady_clock::time_point begin)
+	{
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+	}
 
 	bool recvAll(SOCKET sock, BYTE* buffer, int bytes)
 	{
@@ -160,9 +178,15 @@ BOOL CjetsonUIDlg::OnInitDialog()
 		CRect(330, 8, 1200, 33), this, IDC_STATUS_TEXT);
 	m_statusText.SetFont(font);
 
-	// 로그 리스트박스 (이미지 아래 하단 영역)
+	// 파이프라인 리스트박스 (이미지 오른쪽 상단, 위치는 OnSize에서 결정)
+	m_pipelineList.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
+		CRect(0, 0, 0, 0), this, IDC_PIPELINE_LIST);
+	m_pipelineList.SetFont(font);
+	m_pipelineList.AddString(_T("Pipeline: (no frame yet)"));
+
+	// 로그 리스트박스 (파이프라인 아래, 위치는 OnSize에서 결정)
 	m_logList.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
-		CRect(10, 0, 0, 0), this, IDC_LOG_LIST);
+		CRect(0, 0, 0, 0), this, IDC_LOG_LIST);
 	m_logList.SetFont(font);
 	m_logList.AddString(_T("[System] Initialized."));
 
@@ -200,12 +224,16 @@ void CjetsonUIDlg::OnSize(UINT nType, int cx, int cy)
 {
 	CDialogEx::OnSize(nType, cx, cy);
 
-	// 로그 리스트박스를 이미지 아래에 배치 (높이의 30%)
-	if (m_logList.GetSafeHwnd() != nullptr && cy > kToolbarHeight + 100)
+	// 레이아웃: 이미지(왼쪽) | 오른쪽 열 = 파이프라인(위) + 로그(아래)
+	if (m_logList.GetSafeHwnd() != nullptr && m_pipelineList.GetSafeHwnd() != nullptr
+		&& cy > kToolbarHeight + 100)
 	{
-		int logHeight = (cy - kToolbarHeight) / 3;
-		int imageHeight = cy - kToolbarHeight - logHeight;
-		m_logList.SetWindowPos(nullptr, 10, kToolbarHeight + imageHeight, cx - 20, logHeight, SWP_NOZORDER);
+		int left = sideColumnLeft(cx) + 5;
+		int top = kToolbarHeight + 5;
+		int pipelineBottom = min(top + kPipelineHeight, cy - 40);
+
+		m_pipelineList.SetWindowPos(nullptr, left, top, cx - left - 5, pipelineBottom - top, SWP_NOZORDER);
+		m_logList.SetWindowPos(nullptr, left, pipelineBottom + 5, cx - left - 5, cy - pipelineBottom - 10, SWP_NOZORDER);
 	}
 
 	Invalidate();
@@ -303,11 +331,18 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 		}
 
 		UINT32 width, height, payloadBytes;
-		UINT64 frameNumber;
+		UINT64 frameNumber, captureUs, serviceTotalUs;
+		double h2dMs, cudaMs, d2hMs, totalMs;
 		memcpy(&width, header + 0, 4);
 		memcpy(&height, header + 4, 4);
 		memcpy(&frameNumber, header + 8, 8);
 		memcpy(&payloadBytes, header + 16, 4);
+		memcpy(&captureUs, header + 20, 8);
+		memcpy(&serviceTotalUs, header + 28, 8);
+		memcpy(&h2dMs, header + 36, 8);
+		memcpy(&cudaMs, header + 44, 8);
+		memcpy(&d2hMs, header + 52, 8);
+		memcpy(&totalMs, header + 60, 8);
 
 		if (width == 0 || height == 0 || payloadBytes != width * height || payloadBytes > kMaxPayloadBytes)
 		{
@@ -323,14 +358,16 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 			frameNumber, width, height, payloadBytes, kHeaderBytes);
 		postLog(msg);
 
-		// DIB 규격에 맞게 행을 4바이트 정렬하여 수신 버퍼에 복사
+		// 픽셀 데이터 수신 (소요 시간 = 네트워크 전송 시간 근사치)
 		std::vector<BYTE> raw(payloadBytes);
+		auto transferBegin = std::chrono::steady_clock::now();
 		if (!recvAll(sock, raw.data(), static_cast<int>(payloadBytes)))
 		{
 			msg.Format(_T("[Error] Connection lost while receiving pixel data for frame #%llu"), frameNumber);
 			postLog(msg);
 			break;
 		}
+		double transferMs = elapsedMs(transferBegin);
 
 		// 수신 완료 로그
 		msg.Format(_T("[Frame #%llu] Received: header(%d) + pixels(%u) = total %u bytes"),
@@ -341,13 +378,22 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 		frame->width = width;
 		frame->height = height;
 		frame->frameNumber = frameNumber;
+		frame->captureUs = captureUs;
+		frame->serviceTotalUs = serviceTotalUs;
+		frame->h2dMs = h2dMs;
+		frame->cudaMs = cudaMs;
+		frame->d2hMs = d2hMs;
+		frame->totalMs = totalMs;
+		frame->transferMs = transferMs;
 		frame->strideBytes = (width + 3) & ~3u;
+		auto copyBegin = std::chrono::steady_clock::now();
 		frame->pixels.resize(static_cast<size_t>(frame->strideBytes) * height);
 		for (UINT32 y = 0; y < height; ++y)
 		{
 			memcpy(frame->pixels.data() + static_cast<size_t>(y) * frame->strideBytes,
 				raw.data() + static_cast<size_t>(y) * width, width);
 		}
+		frame->copyMs = elapsedMs(copyBegin);
 
 		PostMessage(WM_APP_FRAME_RECEIVED, 0, reinterpret_cast<LPARAM>(frame));
 	}
@@ -382,8 +428,51 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 		m_frame.frameNumber, m_frame.width, m_frame.height, m_frame.width * m_frame.height);
 	m_statusText.SetWindowText(status);
 
+	// 프레임별 타이밍 로그
+	CString log;
+	log.Format(_T("[Frame #%llu] capture=%.1fms h2d=%.2fms cuda=%.2fms d2h=%.2fms transfer=%.1fms"),
+		m_frame.frameNumber,
+		m_frame.captureUs / 1000.0,
+		m_frame.h2dMs, m_frame.cudaMs, m_frame.d2hMs,
+		m_frame.transferMs);
+	m_logList.AddString(log);
+	m_logList.SetTopIndex(m_logList.GetCount() - 1);
+
+	updateTimingDisplay();
+
 	Invalidate(FALSE);
 	return 0;
+}
+
+void CjetsonUIDlg::updateTimingDisplay()
+{
+	if (!m_hasFrame || m_pipelineList.GetSafeHwnd() == nullptr)
+	{
+		return;
+	}
+
+	// 캡처->렌더링 전체 시간: 두 장비의 시계는 동기화되어 있지 않으므로
+	// 타임스탬프 비교 대신 각 구간 측정치를 더해 근사
+	// (serviceTotal = Capture + GPU 파이프라인 전체를 포함)
+	double e2eMs = m_frame.serviceTotalUs / 1000.0 + m_frame.transferMs + m_frame.copyMs + m_lastRenderMs;
+
+	CString items[7];
+	items[0].Format(_T("Capture    %8.1f ms"), m_frame.captureUs / 1000.0);
+	items[1].Format(_T("H2D        %8.2f ms"), m_frame.h2dMs);
+	items[2].Format(_T("CUDA       %8.2f ms"), m_frame.cudaMs);
+	items[3].Format(_T("D2H        %8.2f ms"), m_frame.d2hMs);
+	items[4].Format(_T("Transfer   %8.1f ms"), m_frame.transferMs);
+	items[5].Format(_T("Render     %8.2f ms"), m_lastRenderMs);
+	items[6].Format(_T("E2E        %8.1f ms"), e2eMs);
+
+	m_pipelineList.SetRedraw(FALSE);
+	m_pipelineList.ResetContent();
+	for (int i = 0; i < 7; ++i)
+	{
+		m_pipelineList.AddString(items[i]);
+	}
+	m_pipelineList.SetRedraw(TRUE);
+	m_pipelineList.Invalidate();
 }
 
 LRESULT CjetsonUIDlg::OnStatusMessage(WPARAM wParam, LPARAM lParam)
@@ -453,6 +542,7 @@ void CjetsonUIDlg::drawFrame(CDC& dc, const CRect& area)
 	int destX = area.left + (area.Width() - destW) / 2;
 	int destY = area.top + (area.Height() - destH) / 2;
 
+	auto renderBegin = std::chrono::steady_clock::now();
 	dc.FillSolidRect(area, RGB(30, 30, 30));
 	SetStretchBltMode(dc.GetSafeHdc(), HALFTONE);
 	SetBrushOrgEx(dc.GetSafeHdc(), 0, 0, nullptr);
@@ -462,6 +552,8 @@ void CjetsonUIDlg::drawFrame(CDC& dc, const CRect& area)
 		m_frame.pixels.data(),
 		reinterpret_cast<const BITMAPINFO*>(&bmi),
 		DIB_RGB_COLORS, SRCCOPY);
+	GdiFlush();	// 배칭된 GDI 명령을 실행시켜 렌더링 시간을 실제에 가깝게 측정
+	m_lastRenderMs = elapsedMs(renderBegin);
 }
 
 // 대화 상자에 최소화 단추를 추가할 경우 아이콘을 그리려면
@@ -493,19 +585,13 @@ void CjetsonUIDlg::OnPaint()
 
 		CRect client;
 		GetClientRect(&client);
-		// 이미지 영역: 툴바 아래에서 로그 리스트박스 위까지
-		if (m_logList.GetSafeHwnd() != nullptr && client.Height() > kToolbarHeight + 100)
-		{
-			int logHeight = (client.Height() - kToolbarHeight) / 3;
-			int imageHeight = client.Height() - kToolbarHeight - logHeight;
-			CRect imageArea(client.left, client.top + kToolbarHeight, client.right, client.top + kToolbarHeight + imageHeight);
-			drawFrame(dc, imageArea);
-		}
-		else
-		{
-			CRect imageArea(client.left, client.top + kToolbarHeight, client.right, client.bottom);
-			drawFrame(dc, imageArea);
-		}
+		// 이미지 영역: 툴바 아래 왼쪽 (오른쪽 열은 파이프라인 + 로그)
+		CRect imageArea(client.left, client.top + kToolbarHeight,
+			client.left + sideColumnLeft(client.Width()), client.bottom);
+		drawFrame(dc, imageArea);
+
+		// 렌더링 시간이 확정된 후 파이프라인 표시 갱신
+		updateTimingDisplay();
 	}
 }
 
