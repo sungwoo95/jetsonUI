@@ -160,6 +160,12 @@ BOOL CjetsonUIDlg::OnInitDialog()
 		CRect(330, 8, 1200, 33), this, IDC_STATUS_TEXT);
 	m_statusText.SetFont(font);
 
+	// 로그 리스트박스 (이미지 아래 하단 영역)
+	m_logList.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
+		CRect(10, 0, 0, 0), this, IDC_LOG_LIST);
+	m_logList.SetFont(font);
+	m_logList.AddString(_T("[System] Initialized."));
+
 	return TRUE;  // 포커스를 컨트롤에 설정하지 않으면 TRUE를 반환합니다.
 }
 
@@ -193,6 +199,15 @@ void CjetsonUIDlg::OnDestroy()
 void CjetsonUIDlg::OnSize(UINT nType, int cx, int cy)
 {
 	CDialogEx::OnSize(nType, cx, cy);
+
+	// 로그 리스트박스를 이미지 아래에 배치 (높이의 30%)
+	if (m_logList.GetSafeHwnd() != nullptr && cy > kToolbarHeight + 100)
+	{
+		int logHeight = (cy - kToolbarHeight) / 3;
+		int imageHeight = cy - kToolbarHeight - logHeight;
+		m_logList.SetWindowPos(nullptr, 10, kToolbarHeight + imageHeight, cx - 20, logHeight, SWP_NOZORDER);
+	}
+
 	Invalidate();
 }
 
@@ -230,6 +245,12 @@ void CjetsonUIDlg::postStatus(const CString& text)
 	PostMessage(WM_APP_STATUS, 0, reinterpret_cast<LPARAM>(new CString(text)));
 }
 
+void CjetsonUIDlg::postLog(const CString& text)
+{
+	// UI 스레드에서 해제하는 힙 문자열로 전달
+	PostMessage(WM_APP_STATUS, 2, reinterpret_cast<LPARAM>(new CString(text)));
+}
+
 void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 {
 	SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -261,19 +282,23 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 	{
 		msg.Format(_T("Connect failed (WSA error %d)."), WSAGetLastError());
 		postStatus(msg);
+		postLog(msg);
 		SOCKET s = m_socket.exchange(INVALID_SOCKET);
 		if (s != INVALID_SOCKET) closesocket(s);
 		PostMessage(WM_APP_STATUS, 1, 0);
 		return;
 	}
 
+	msg.Format(_T("[%02d:%02d:%02d] Connected to %hs:%d"), 0, 0, 0, (LPCSTR)host, port);
 	postStatus(_T("Connected. Waiting for image ..."));
+	postLog(msg);
 
 	for (;;)
 	{
 		BYTE header[kHeaderBytes];
 		if (!recvAll(sock, header, kHeaderBytes))
 		{
+			postLog(_T("[Error] Connection lost while receiving header."));
 			break;
 		}
 
@@ -286,18 +311,31 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 
 		if (width == 0 || height == 0 || payloadBytes != width * height || payloadBytes > kMaxPayloadBytes)
 		{
-			msg.Format(_T("Invalid header (w=%u h=%u payload=%u). Disconnecting."), width, height, payloadBytes);
+			msg.Format(_T("[Error] Invalid header (w=%u h=%u payload=%u). Disconnecting."), width, height, payloadBytes);
 			postStatus(msg);
+			postLog(msg);
 			break;
 		}
+
+		// 헤더 수신 로그
+		UINT32 totalRecvBytes = kHeaderBytes + payloadBytes;
+		msg.Format(_T("[Frame #%llu] Header received: %u x %u, expecting %u bytes (header: %d)"),
+			frameNumber, width, height, payloadBytes, kHeaderBytes);
+		postLog(msg);
 
 		// DIB 규격에 맞게 행을 4바이트 정렬하여 수신 버퍼에 복사
 		std::vector<BYTE> raw(payloadBytes);
 		if (!recvAll(sock, raw.data(), static_cast<int>(payloadBytes)))
 		{
-			postStatus(_T("Connection lost while receiving pixel data."));
+			msg.Format(_T("[Error] Connection lost while receiving pixel data for frame #%llu"), frameNumber);
+			postLog(msg);
 			break;
 		}
+
+		// 수신 완료 로그
+		msg.Format(_T("[Frame #%llu] Received: header(%d) + pixels(%u) = total %u bytes"),
+			frameNumber, kHeaderBytes, payloadBytes, totalRecvBytes);
+		postLog(msg);
 
 		auto* frame = new ReceivedFrame();
 		frame->width = width;
@@ -319,6 +357,7 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 	{
 		closesocket(s);
 		postStatus(_T("Disconnected."));
+		postLog(_T("[System] Connection closed."));
 	}
 	PostMessage(WM_APP_STATUS, 1, 0);	// wParam=1: 스레드 종료 알림 (버튼 재활성화)
 }
@@ -352,7 +391,22 @@ LRESULT CjetsonUIDlg::OnStatusMessage(WPARAM wParam, LPARAM lParam)
 	CString* text = reinterpret_cast<CString*>(lParam);
 	if (text != nullptr)
 	{
-		m_statusText.SetWindowText(*text);
+		if (wParam == 2)
+		{
+			// 로그 메시지 추가
+			m_logList.AddString(*text);
+			// 최신 항목으로 스크롤
+			int count = m_logList.GetCount();
+			if (count > 0)
+			{
+				m_logList.SetTopIndex(count - 1);
+			}
+		}
+		else
+		{
+			// 상태 텍스트 업데이트
+			m_statusText.SetWindowText(*text);
+		}
 		delete text;
 	}
 	if (wParam == 1)
@@ -439,8 +493,19 @@ void CjetsonUIDlg::OnPaint()
 
 		CRect client;
 		GetClientRect(&client);
-		CRect imageArea(client.left, client.top + kToolbarHeight, client.right, client.bottom);
-		drawFrame(dc, imageArea);
+		// 이미지 영역: 툴바 아래에서 로그 리스트박스 위까지
+		if (m_logList.GetSafeHwnd() != nullptr && client.Height() > kToolbarHeight + 100)
+		{
+			int logHeight = (client.Height() - kToolbarHeight) / 3;
+			int imageHeight = client.Height() - kToolbarHeight - logHeight;
+			CRect imageArea(client.left, client.top + kToolbarHeight, client.right, client.top + kToolbarHeight + imageHeight);
+			drawFrame(dc, imageArea);
+		}
+		else
+		{
+			CRect imageArea(client.left, client.top + kToolbarHeight, client.right, client.bottom);
+			drawFrame(dc, imageArea);
+		}
 	}
 }
 

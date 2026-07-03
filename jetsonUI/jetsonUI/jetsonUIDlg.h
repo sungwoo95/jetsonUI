@@ -46,11 +46,13 @@ protected:
 		IDC_PORT_EDIT,
 		IDC_BTN_CONNECT,
 		IDC_STATUS_TEXT,
+		IDC_LOG_LIST,
 	};
 	CEdit m_hostEdit;
 	CEdit m_portEdit;
 	CButton m_connectButton;
 	CStatic m_statusText;
+	CListBox m_logList;
 
 	// 수신 스레드 상태
 	std::thread m_recvThread;
@@ -63,6 +65,7 @@ protected:
 
 	void receiveLoop(CStringA host, int port);
 	void postStatus(const CString& text);
+	void postLog(const CString& text);
 	void joinReceiveThread();
 	void drawFrame(CDC& dc, const CRect& area);
 
