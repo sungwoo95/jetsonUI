@@ -34,7 +34,7 @@ namespace
 
 	// 오른쪽 정보 열(파이프라인 + 로그) 레이아웃
 	constexpr int kSideColumnMinWidth = 230;
-	constexpr int kPipelineHeight = 215;	// 파이프라인 리스트 높이 (9항목 + 여유)
+	constexpr int kPipelineHeight = 250;	// 파이프라인 리스트 높이 (11항목 + 여유)
 
 	// 오른쪽 열의 시작 x 좌표 (이미지와 정보 열의 경계)
 	int sideColumnLeft(int clientWidth)
@@ -289,6 +289,11 @@ void CjetsonUIDlg::OnBnClickedConnect()
 
 	m_connectButton.EnableWindow(FALSE);
 
+	// FPS 상태 초기화 (새 세션은 처음부터 측정)
+	m_haveFrameTime = false;
+	m_fps = 0.0;
+	m_displayedFrames = 0;
+
 	CStringA hostA(hostText);
 	m_recvThread = std::thread(&CjetsonUIDlg::receiveLoop, this, hostA, port);
 }
@@ -475,20 +480,39 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 	}
 	delete frame;
 
+	// FPS: 이전 프레임과의 수신 간격으로 계산, EMA(0.2)로 평활화
+	auto now = std::chrono::steady_clock::now();
+	if (m_haveFrameTime)
+	{
+		double deltaMs = std::chrono::duration<double, std::milli>(now - m_lastFrameTime).count();
+		if (deltaMs > 0.0)
+		{
+			double inst = 1000.0 / deltaMs;
+			m_fps = (m_fps > 0.0) ? (m_fps * 0.8 + inst * 0.2) : inst;
+		}
+	}
+	m_lastFrameTime = now;
+	m_haveFrameTime = true;
+	++m_displayedFrames;
+
 	CString status;
-	status.Format(_T("Frame #%llu received: %u x %u (%u bytes)"),
-		m_frame.frameNumber, m_frame.width, m_frame.height, m_frame.width * m_frame.height);
+	status.Format(_T("Frame #%llu  %u x %u  |  %.1f fps  (displayed %llu)"),
+		m_frame.frameNumber, m_frame.width, m_frame.height, m_fps, m_displayedFrames);
 	m_statusText.SetWindowText(status);
 
-	// 프레임별 타이밍 로그
+	// 프레임별 타이밍 로그 (스트리밍 시 무한 증가 방지: 최근 200개만 유지)
 	CString log;
-	log.Format(_T("[Frame #%llu] %s %u bytes | capture=%.1fms encode=%.1fms transfer=%.1fms decode=%.1fms"),
+	log.Format(_T("[#%llu] %s %u bytes | cap=%.1f enc=%.1f xfer=%.1f dec=%.1f | %.1ffps"),
 		m_frame.frameNumber,
 		(m_frame.format == kFormatJpeg) ? _T("JPEG") : _T("RAW"),
 		m_frame.payloadBytes,
 		m_frame.captureUs / 1000.0,
-		m_frame.encodeMs, m_frame.transferMs, m_frame.decodeMs);
+		m_frame.encodeMs, m_frame.transferMs, m_frame.decodeMs, m_fps);
 	m_logList.AddString(log);
+	while (m_logList.GetCount() > 200)
+	{
+		m_logList.DeleteString(0);
+	}
 	m_logList.SetTopIndex(m_logList.GetCount() - 1);
 
 	updateTimingDisplay();
@@ -510,7 +534,7 @@ void CjetsonUIDlg::updateTimingDisplay()
 	double e2eMs = m_frame.serviceTotalUs / 1000.0 + m_frame.encodeMs
 		+ m_frame.transferMs + m_frame.decodeMs + m_frame.copyMs + m_lastRenderMs;
 
-	CString items[9];
+	CString items[11];
 	items[0].Format(_T("Capture    %8.1f ms"), m_frame.captureUs / 1000.0);
 	items[1].Format(_T("H2D        %8.2f ms"), m_frame.h2dMs);
 	items[2].Format(_T("CUDA       %8.2f ms"), m_frame.cudaMs);
@@ -520,10 +544,12 @@ void CjetsonUIDlg::updateTimingDisplay()
 	items[6].Format(_T("Decode     %8.2f ms"), m_frame.decodeMs);
 	items[7].Format(_T("Render     %8.2f ms"), m_lastRenderMs);
 	items[8].Format(_T("E2E        %8.1f ms"), e2eMs);
+	items[9] = _T("------------------------");
+	items[10].Format(_T("FPS        %8.1f"), m_fps);
 
 	m_pipelineList.SetRedraw(FALSE);
 	m_pipelineList.ResetContent();
-	for (int i = 0; i < 9; ++i)
+	for (int i = 0; i < 11; ++i)
 	{
 		m_pipelineList.AddString(items[i]);
 	}

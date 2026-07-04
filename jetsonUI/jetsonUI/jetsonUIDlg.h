@@ -85,6 +85,12 @@ protected:
 	ReceivedFrame m_frame;
 	bool m_hasFrame = false;
 
+	// FPS 측정 (UI 스레드에서 수신 간격 기준, 지수이동평균으로 평활화)
+	std::chrono::steady_clock::time_point m_lastFrameTime;
+	bool m_haveFrameTime = false;
+	double m_fps = 0.0;
+	UINT64 m_displayedFrames = 0;
+
 	void receiveLoop(CStringA host, int port);
 	void postStatus(const CString& text);
 	void postLog(const CString& text);
