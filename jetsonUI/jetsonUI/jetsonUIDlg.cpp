@@ -28,6 +28,11 @@ namespace
 
 	constexpr UINT WM_APP_FRAME_RECEIVED = WM_APP + 1;
 	constexpr UINT WM_APP_STATUS = WM_APP + 2;
+	// WM_APP_STATUS wParam: 0=상태텍스트, 1=스레드 종료, 2=로그, 3=연결 수립
+
+	// UI -> 젯슨 제어 명령 (젯슨 tcp_server.h Command와 동일)
+	constexpr BYTE kCmdStartGrab = 1;
+	constexpr BYTE kCmdStopGrab = 2;
 
 	// 상단 컨트롤 영역 높이 (픽셀)
 	constexpr int kToolbarHeight = 40;
@@ -141,6 +146,7 @@ BEGIN_MESSAGE_MAP(CjetsonUIDlg, CDialogEx)
 	ON_WM_DESTROY()
 	ON_WM_SIZE()
 	ON_BN_CLICKED(IDC_BTN_CONNECT, &CjetsonUIDlg::OnBnClickedConnect)
+	ON_BN_CLICKED(IDC_BTN_GRAB, &CjetsonUIDlg::OnBnClickedGrab)
 	ON_MESSAGE(WM_APP_FRAME_RECEIVED, &CjetsonUIDlg::OnFrameReceived)
 	ON_MESSAGE(WM_APP_STATUS, &CjetsonUIDlg::OnStatusMessage)
 END_MESSAGE_MAP()
@@ -200,8 +206,13 @@ BOOL CjetsonUIDlg::OnInitDialog()
 		CRect(226, 8, 320, 33), this, IDC_BTN_CONNECT);
 	m_connectButton.SetFont(font);
 
+	m_grabButton.Create(_T("Start Grab"), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+		CRect(328, 8, 432, 33), this, IDC_BTN_GRAB);
+	m_grabButton.SetFont(font);
+	m_grabButton.EnableWindow(FALSE);	// 연결 전에는 비활성
+
 	m_statusText.Create(_T("Ready."), WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-		CRect(330, 8, 1200, 33), this, IDC_STATUS_TEXT);
+		CRect(442, 8, 1200, 33), this, IDC_STATUS_TEXT);
 	m_statusText.SetFont(font);
 
 	// 파이프라인 리스트박스 (이미지 오른쪽 상단, 위치는 OnSize에서 결정)
@@ -277,6 +288,19 @@ void CjetsonUIDlg::joinReceiveThread()
 
 void CjetsonUIDlg::OnBnClickedConnect()
 {
+	// 연결 중이면 Disconnect로 동작: 소켓을 닫아 수신 스레드를 깨우고
+	// 스레드 종료 알림(wParam=1)에서 버튼 상태가 복원된다.
+	if (m_socket.load() != INVALID_SOCKET)
+	{
+		m_connectButton.EnableWindow(FALSE);
+		SOCKET s = m_socket.exchange(INVALID_SOCKET);
+		if (s != INVALID_SOCKET)
+		{
+			closesocket(s);
+		}
+		return;
+	}
+
 	joinReceiveThread();
 
 	CString hostText, portText;
@@ -302,6 +326,28 @@ void CjetsonUIDlg::OnBnClickedConnect()
 
 	CStringA hostA(hostText);
 	m_recvThread = std::thread(&CjetsonUIDlg::receiveLoop, this, hostA, port);
+}
+
+void CjetsonUIDlg::OnBnClickedGrab()
+{
+	SOCKET s = m_socket.load();
+	if (s == INVALID_SOCKET)
+	{
+		return;
+	}
+
+	// 젯슨으로 1바이트 제어 명령 송신 (수신과 독립적인 방향이라 UI 스레드에서 안전)
+	BYTE cmd = m_grabbing ? kCmdStopGrab : kCmdStartGrab;
+	if (send(s, reinterpret_cast<const char*>(&cmd), 1, 0) != 1)
+	{
+		m_logList.AddString(_T("[Error] Failed to send grab command."));
+		return;
+	}
+
+	m_grabbing = !m_grabbing;
+	m_grabButton.SetWindowText(m_grabbing ? _T("Stop Grab") : _T("Start Grab"));
+	m_logList.AddString(m_grabbing ? _T("[System] Grab start requested.") : _T("[System] Grab stop requested."));
+	m_logList.SetTopIndex(m_logList.GetCount() - 1);
 }
 
 void CjetsonUIDlg::postStatus(const CString& text)
@@ -355,8 +401,9 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 	}
 
 	msg.Format(_T("[%02d:%02d:%02d] Connected to %hs:%d"), 0, 0, 0, (LPCSTR)host, port);
-	postStatus(_T("Connected. Waiting for image ..."));
+	postStatus(_T("Connected. Press Start Grab."));
 	postLog(msg);
+	PostMessage(WM_APP_STATUS, 3, 0);	// 연결 수립: Disconnect/Start Grab 버튼 활성화
 
 	for (;;)
 	{
@@ -613,7 +660,21 @@ LRESULT CjetsonUIDlg::OnStatusMessage(WPARAM wParam, LPARAM lParam)
 	}
 	if (wParam == 1)
 	{
+		// 수신 스레드 종료: 연결 전 상태로 복원
+		m_connectButton.SetWindowText(_T("Connect"));
 		m_connectButton.EnableWindow(TRUE);
+		m_grabbing = false;
+		m_grabButton.SetWindowText(_T("Start Grab"));
+		m_grabButton.EnableWindow(FALSE);
+	}
+	else if (wParam == 3)
+	{
+		// 연결 수립: Disconnect 토글 + 그랩 버튼 활성화
+		m_connectButton.SetWindowText(_T("Disconnect"));
+		m_connectButton.EnableWindow(TRUE);
+		m_grabbing = false;
+		m_grabButton.SetWindowText(_T("Start Grab"));
+		m_grabButton.EnableWindow(TRUE);
 	}
 	return 0;
 }

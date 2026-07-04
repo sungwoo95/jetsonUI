@@ -83,13 +83,16 @@ protected:
 		IDC_HOST_EDIT = 2001,
 		IDC_PORT_EDIT,
 		IDC_BTN_CONNECT,
+		IDC_BTN_GRAB,
 		IDC_STATUS_TEXT,
 		IDC_LOG_LIST,
 		IDC_PIPELINE_LIST,
 	};
 	CEdit m_hostEdit;
 	CEdit m_portEdit;
-	CButton m_connectButton;
+	CButton m_connectButton;	// Connect <-> Disconnect 토글
+	CButton m_grabButton;		// Start Grab <-> Stop Grab 토글 (연결 중에만 활성)
+	bool m_grabbing = false;
 	CStatic m_statusText;
 	CListBox m_logList;
 	CListBox m_pipelineList;	// 이미지 오른쪽: 파이프라인 단계별 시간 (현재/평균)
@@ -133,6 +136,7 @@ protected:
 	afx_msg void OnPaint();
 	afx_msg HCURSOR OnQueryDragIcon();
 	afx_msg void OnBnClickedConnect();
+	afx_msg void OnBnClickedGrab();
 	afx_msg void OnDestroy();
 	afx_msg void OnSize(UINT nType, int cx, int cy);
 	afx_msg LRESULT OnFrameReceived(WPARAM wParam, LPARAM lParam);
