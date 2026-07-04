@@ -34,7 +34,7 @@ namespace
 
 	// 오른쪽 정보 열(파이프라인 + 로그) 레이아웃
 	constexpr int kSideColumnMinWidth = 230;
-	constexpr int kPipelineHeight = 250;	// 파이프라인 리스트 높이 (11항목 + 여유)
+	constexpr int kPipelineHeight = 275;	// 파이프라인 리스트 높이 (헤더+9단계+구분+FPS = 12행)
 
 	// 오른쪽 열의 시작 x 좌표 (이미지와 정보 열의 경계)
 	int sideColumnLeft(int clientWidth)
@@ -205,9 +205,11 @@ BOOL CjetsonUIDlg::OnInitDialog()
 	m_statusText.SetFont(font);
 
 	// 파이프라인 리스트박스 (이미지 오른쪽 상단, 위치는 OnSize에서 결정)
+	// 현재/평균 열 정렬을 위해 고정폭 폰트 사용
+	m_monoFont.CreatePointFont(90, _T("Consolas"));
 	m_pipelineList.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
 		CRect(0, 0, 0, 0), this, IDC_PIPELINE_LIST);
-	m_pipelineList.SetFont(font);
+	m_pipelineList.SetFont(&m_monoFont);
 	m_pipelineList.AddString(_T("Pipeline: (no frame yet)"));
 
 	// 로그 리스트박스 (파이프라인 아래, 위치는 OnSize에서 결정)
@@ -289,10 +291,14 @@ void CjetsonUIDlg::OnBnClickedConnect()
 
 	m_connectButton.EnableWindow(FALSE);
 
-	// FPS 상태 초기화 (새 세션은 처음부터 측정)
+	// FPS/이동평균 상태 초기화 (새 세션은 처음부터 측정)
 	m_haveFrameTime = false;
 	m_fps = 0.0;
 	m_displayedFrames = 0;
+	for (int i = 0; i < PS_COUNT; ++i)
+	{
+		m_avg[i].reset();
+	}
 
 	CStringA hostA(hostText);
 	m_recvThread = std::thread(&CjetsonUIDlg::receiveLoop, this, hostA, port);
@@ -515,6 +521,19 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 	}
 	m_logList.SetTopIndex(m_logList.GetCount() - 1);
 
+	// 이동평균 갱신 (프레임당 1회. Render는 직전 프레임 값이라 1프레임 지연 — 무시 가능)
+	double e2e = m_frame.serviceTotalUs / 1000.0 + m_frame.encodeMs
+		+ m_frame.transferMs + m_frame.decodeMs + m_frame.copyMs + m_lastRenderMs;
+	m_avg[PS_CAPTURE].add(m_frame.captureUs / 1000.0);
+	m_avg[PS_H2D].add(m_frame.h2dMs);
+	m_avg[PS_CUDA].add(m_frame.cudaMs);
+	m_avg[PS_D2H].add(m_frame.d2hMs);
+	m_avg[PS_ENCODE].add(m_frame.encodeMs);
+	m_avg[PS_TRANSFER].add(m_frame.transferMs);
+	m_avg[PS_DECODE].add(m_frame.decodeMs);
+	m_avg[PS_RENDER].add(m_lastRenderMs);
+	m_avg[PS_E2E].add(e2e);
+
 	updateTimingDisplay();
 
 	Invalidate(FALSE);
@@ -531,28 +550,40 @@ void CjetsonUIDlg::updateTimingDisplay()
 	// 캡처->렌더링 전체 시간: 두 장비의 시계는 동기화되어 있지 않으므로
 	// 타임스탬프 비교 대신 각 구간 측정치를 더해 근사
 	// (serviceTotal = Capture + GPU 파이프라인 전체를 포함)
-	double e2eMs = m_frame.serviceTotalUs / 1000.0 + m_frame.encodeMs
+	double e2eNow = m_frame.serviceTotalUs / 1000.0 + m_frame.encodeMs
 		+ m_frame.transferMs + m_frame.decodeMs + m_frame.copyMs + m_lastRenderMs;
 
-	CString items[11];
-	items[0].Format(_T("Capture    %8.1f ms"), m_frame.captureUs / 1000.0);
-	items[1].Format(_T("H2D        %8.2f ms"), m_frame.h2dMs);
-	items[2].Format(_T("CUDA       %8.2f ms"), m_frame.cudaMs);
-	items[3].Format(_T("D2H        %8.2f ms"), m_frame.d2hMs);
-	items[4].Format(_T("Encode     %8.2f ms"), m_frame.encodeMs);
-	items[5].Format(_T("Transfer   %8.1f ms"), m_frame.transferMs);
-	items[6].Format(_T("Decode     %8.2f ms"), m_frame.decodeMs);
-	items[7].Format(_T("Render     %8.2f ms"), m_lastRenderMs);
-	items[8].Format(_T("E2E        %8.1f ms"), e2eMs);
-	items[9] = _T("------------------------");
-	items[10].Format(_T("FPS        %8.1f"), m_fps);
+	// 3열 표: 단계 / 현재 프레임(now) / 최근 N프레임 이동평균(avg)
+	struct Row { const TCHAR* label; double now; int stage; };
+	Row rows[] = {
+		{ _T("Capture"),  m_frame.captureUs / 1000.0, PS_CAPTURE },
+		{ _T("H2D"),      m_frame.h2dMs,              PS_H2D },
+		{ _T("CUDA"),     m_frame.cudaMs,             PS_CUDA },
+		{ _T("D2H"),      m_frame.d2hMs,              PS_D2H },
+		{ _T("Encode"),   m_frame.encodeMs,           PS_ENCODE },
+		{ _T("Transfer"), m_frame.transferMs,         PS_TRANSFER },
+		{ _T("Decode"),   m_frame.decodeMs,           PS_DECODE },
+		{ _T("Render"),   m_lastRenderMs,             PS_RENDER },
+		{ _T("E2E"),      e2eNow,                     PS_E2E },
+	};
 
 	m_pipelineList.SetRedraw(FALSE);
 	m_pipelineList.ResetContent();
-	for (int i = 0; i < 11; ++i)
+
+	CString header;
+	header.Format(_T("%-8s %8s %8s"), _T("Stage"), _T("now"), _T("avg"));
+	m_pipelineList.AddString(header);
+
+	CString line;
+	for (const Row& r : rows)
 	{
-		m_pipelineList.AddString(items[i]);
+		line.Format(_T("%-8s %8.1f %8.1f"), r.label, r.now, m_avg[r.stage].mean());
+		m_pipelineList.AddString(line);
 	}
+	m_pipelineList.AddString(_T("-------------------------"));
+	line.Format(_T("%-8s %8.1f"), _T("FPS"), m_fps);	// FPS는 평활된 단일 값
+	m_pipelineList.AddString(line);
+
 	m_pipelineList.SetRedraw(TRUE);
 	m_pipelineList.Invalidate();
 }

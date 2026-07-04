@@ -36,6 +36,27 @@ struct ReceivedFrame
 	double copyMs = 0.0;        // DIB 정렬 버퍼 복사 (ms)
 };
 
+// 최근 N프레임 이동평균 (링 버퍼 + running sum)
+class RollingMean
+{
+public:
+	void add(double v)
+	{
+		if (count_ < kWindow) { buf_[head_] = v; sum_ += v; ++count_; }
+		else { sum_ -= buf_[head_]; buf_[head_] = v; sum_ += v; }
+		head_ = (head_ + 1) % kWindow;
+	}
+	void reset() { count_ = 0; head_ = 0; sum_ = 0.0; }
+	double mean() const { return count_ > 0 ? sum_ / count_ : 0.0; }
+
+private:
+	static const int kWindow = 60;
+	double buf_[kWindow] = {};
+	int count_ = 0;
+	int head_ = 0;
+	double sum_ = 0.0;
+};
+
 // CjetsonUIDlg 대화 상자
 class CjetsonUIDlg : public CDialogEx
 {
@@ -71,7 +92,13 @@ protected:
 	CButton m_connectButton;
 	CStatic m_statusText;
 	CListBox m_logList;
-	CListBox m_pipelineList;	// 이미지 오른쪽: 파이프라인 단계별 시간
+	CListBox m_pipelineList;	// 이미지 오른쪽: 파이프라인 단계별 시간 (현재/평균)
+	CFont m_monoFont;			// 파이프라인 표 정렬용 고정폭 폰트
+
+	// 파이프라인 단계 인덱스 (현재값/이동평균 공용). FPS는 단일 평활값이라 제외.
+	enum { PS_CAPTURE, PS_H2D, PS_CUDA, PS_D2H, PS_ENCODE,
+		PS_TRANSFER, PS_DECODE, PS_RENDER, PS_E2E, PS_COUNT };
+	RollingMean m_avg[PS_COUNT];	// 단계별 최근 N프레임 이동평균
 
 	// 마지막 렌더링(StretchDIBits) 소요 시간 (UI 스레드에서만 접근)
 	double m_lastRenderMs = 0.0;
