@@ -395,20 +395,15 @@ void CjetsonUIDlg::OnBnClickedGrab()
 	{
 		m_logFirstFrame = true;	// 이번 그랩의 첫 프레임 수신 상세를 1회 로그
 
-		// 새 그랩은 측정을 초기화하고 warmup 프레임을 측정에서 제외.
-		// (젯슨이 START 시 버퍼를 flush하므로 버스트는 거의 없지만, 첫 프레임
-		//  정착분을 위해 소수 프레임은 제외한다.)
-		m_warmupRemaining = 3;
+		// 새 그랩은 측정을 초기화 (FPS 기준을 리셋해 stop/start 사이의 긴 공백이
+		// 첫 프레임 간격으로 잡히지 않게 하고, 평균도 이번 그랩 기준으로 새로 시작)
 		m_haveFrameTime = false;
 		m_fps = 0.0;
+		m_warmupRemaining = 2;	// flush 후 cold-start 첫 프레임 등 처음 2장 측정 제외
 		for (int i = 0; i < PS_COUNT; ++i)
 		{
 			m_avg[i].reset();
 		}
-		CString wu;
-		wu.Format(_T("[System] Warmup: excluding first %d frames from averages."), m_warmupRemaining);
-		m_logList.AddString(wu);
-		m_logList.SetTopIndex(m_logList.GetCount() - 1);
 	}
 	m_grabButton.SetWindowText(m_grabbing ? _T("Stop Grab") : _T("Start Grab"));
 	m_logList.AddString(m_grabbing ? _T("[System] Grab start requested.") : _T("[System] Grab stop requested."));
@@ -589,24 +584,19 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 
 	++m_displayedFrames;
 
-	// warmup: 그랩 시작 후 처음 N프레임은 버퍼 드레인 과도구간이라
-	// FPS/이동평균 측정에서 제외한다 (이미지는 정상 표시).
+	// warmup: flush 직후 첫 프레임은 파이프라인 겹침 없이 노출을 통째로 기다려
+	// 캡처 시간이 높게 나오는 cold-start outlier다. 처음 2프레임을 측정에서
+	// 제외해 평균이 처음부터 안정값을 보이게 한다 (이미지·now 열은 정상 표시).
 	bool warmup = (m_warmupRemaining > 0);
 	if (warmup)
 	{
 		--m_warmupRemaining;
-		if (m_warmupRemaining == 0)
-		{
-			// 마지막 warmup 프레임: 다음부터 측정 시작을 로그로 표시
-			m_logList.AddString(_T("[System] Warmup done. Measuring averages now."));
-			m_logList.SetTopIndex(m_logList.GetCount() - 1);
-		}
 	}
 
+	// FPS: 직전 (정상) 프레임과의 수신 간격으로 계산, EMA(0.2)로 평활화
 	auto now = std::chrono::steady_clock::now();
 	if (!warmup)
 	{
-		// FPS: 직전 정상 프레임과의 간격으로 계산, EMA(0.2)로 평활화
 		if (m_haveFrameTime)
 		{
 			double deltaMs = std::chrono::duration<double, std::milli>(now - m_lastFrameTime).count();
@@ -621,16 +611,8 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 	}
 
 	CString status;
-	if (warmup)
-	{
-		status.Format(_T("Frame #%llu  %u x %u  |  warming up... (%d left)  (displayed %llu)"),
-			m_frame.frameNumber, m_frame.width, m_frame.height, m_warmupRemaining, m_displayedFrames);
-	}
-	else
-	{
-		status.Format(_T("Frame #%llu  %u x %u  |  %.1f fps  (displayed %llu)"),
-			m_frame.frameNumber, m_frame.width, m_frame.height, m_fps, m_displayedFrames);
-	}
+	status.Format(_T("Frame #%llu  %u x %u  |  %.1f fps  (displayed %llu)"),
+		m_frame.frameNumber, m_frame.width, m_frame.height, m_fps, m_displayedFrames);
 	m_statusText.SetWindowText(status);
 
 	// 수신 상세(바이트 수 등)는 그랩 시작 후 첫 프레임만 로그 — 이후 프레임은
@@ -648,8 +630,8 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 		m_logList.SetTopIndex(m_logList.GetCount() - 1);
 	}
 
-	// 이동평균 갱신 (warmup 프레임은 제외 — 지속 성능만 반영. 프레임당 1회.
-	// Render는 직전 프레임 값이라 1프레임 지연 — 무시 가능)
+	// 이동평균 갱신 (warmup 프레임은 제외. 프레임당 1회. Render는 직전 프레임
+	// 값이라 1프레임 지연 — 무시 가능)
 	if (!warmup)
 	{
 		double e2e = m_frame.serviceTotalUs / 1000.0 + m_frame.encodeMs
