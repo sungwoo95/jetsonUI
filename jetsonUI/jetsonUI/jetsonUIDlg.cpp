@@ -9,6 +9,7 @@
 #include "afxdialogex.h"
 
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
@@ -67,23 +68,37 @@ namespace
 		return true;
 	}
 
-	// JPEG을 8bit grayscale(행 4바이트 정렬) 버퍼로 디코딩 (OpenCV cv::imdecode)
-	// IMREAD_GRAYSCALE로 libjpeg-turbo(SIMD) 경로를 사용하며, DIB stride에 맞춰 행 단위 복사.
+	// 축소 디코드 배율: 표시 영역(~1000px)이 원본(2472px)보다 작으므로
+	// JPEG 디코드 단계에서 1/2로 축소해 디코드·렌더 비용을 동시에 줄인다.
+	constexpr int kDecodeReduce = 2;
+
+	// JPEG을 8bit grayscale(행 4바이트 정렬) 버퍼로 1/2 축소 디코딩.
+	// out 버퍼를 Mat으로 감싸 imdecode가 직접 그 메모리에 쓰게 하여(dst 재사용)
+	// 매 프레임 Mat 할당과 행 단위 stride 복사를 제거한다.
+	// width/height: 축소 후 기대 크기.
 	bool decodeJpegToGray(const BYTE* data, UINT32 bytes, UINT32 width, UINT32 height,
 		int strideBytes, std::vector<BYTE>& out)
 	{
 		// 입력 버퍼를 복사 없이 감싸는 1xN Mat (imdecode가 내부적으로 파싱)
 		cv::Mat encoded(1, static_cast<int>(bytes), CV_8UC1, const_cast<BYTE*>(data));
-		cv::Mat gray = cv::imdecode(encoded, cv::IMREAD_GRAYSCALE);
-		if (gray.empty() || gray.cols != static_cast<int>(width) || gray.rows != static_cast<int>(height))
+
+		out.resize(static_cast<size_t>(strideBytes) * height);
+		// out 메모리를 그대로 목적지로 사용 (크기/타입이 일치하면 재할당 없이 직접 기록)
+		cv::Mat dst(static_cast<int>(height), static_cast<int>(width), CV_8UC1,
+			out.data(), static_cast<size_t>(strideBytes));
+		cv::Mat res = cv::imdecode(encoded, cv::IMREAD_REDUCED_GRAYSCALE_2, &dst);
+		if (res.empty() || res.cols != static_cast<int>(width) || res.rows != static_cast<int>(height))
 		{
 			return false;
 		}
 
-		out.resize(static_cast<size_t>(strideBytes) * height);
-		for (UINT32 y = 0; y < height; ++y)
+		// 디코더가 크기 불일치 등으로 자체 버퍼를 할당한 경우에만 폴백 복사
+		if (res.data != out.data())
 		{
-			memcpy(out.data() + static_cast<size_t>(y) * strideBytes, gray.ptr(y), width);
+			for (UINT32 y = 0; y < height; ++y)
+			{
+				memcpy(out.data() + static_cast<size_t>(y) * strideBytes, res.ptr(y), width);
+			}
 		}
 		return true;
 	}
@@ -268,6 +283,13 @@ void CjetsonUIDlg::OnDestroy()
 	joinReceiveThread();
 	WSACleanup();
 
+	// 백버퍼 정리 (선택 해제 후 파괴)
+	if (m_backOld != nullptr)
+	{
+		m_backDC.SelectObject(m_backOld);
+		m_backOld = nullptr;
+	}
+
 	CDialogEx::OnDestroy();
 }
 
@@ -322,6 +344,14 @@ void CjetsonUIDlg::layoutControls()
 
 	m_pipelineList.SetWindowPos(nullptr, left, top, width, pipelineH, SWP_NOZORDER);
 	m_logList.SetWindowPos(nullptr, left, top + pipelineH + 5, width, columnH - pipelineH - 5, SWP_NOZORDER);
+
+	// 이미지 표시 영역 (왼쪽 열). 크기가 바뀌면 백버퍼를 다시 렌더링한다.
+	CRect newArea(client.left, client.top + kToolbarHeight, client.left + sideColumnLeft(cx), client.bottom);
+	if (newArea != m_imageArea)
+	{
+		m_imageArea = newArea;
+		renderFrameToBackBuffer();
+	}
 }
 
 void CjetsonUIDlg::joinReceiveThread()
@@ -513,8 +543,8 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 		double transferMs = elapsedMs(transferBegin);
 
 		auto* frame = new ReceivedFrame();
-		frame->width = width;
-		frame->height = height;
+		frame->nativeWidth = width;
+		frame->nativeHeight = height;
 		frame->frameNumber = frameNumber;
 		frame->captureUs = captureUs;
 		frame->serviceTotalUs = serviceTotalUs;
@@ -526,13 +556,16 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 		frame->encodeMs = (format == kFormatJpeg) ? encodeMs : 0.0;
 		frame->payloadBytes = payloadBytes;
 		frame->transferMs = transferMs;
-		frame->strideBytes = (width + 3) & ~3u;
 
 		if (format == kFormatJpeg)
 		{
-			// JPEG 디코딩 (수신 스레드에서 수행해 UI 스레드 부하 방지)
+			// 1/2 축소 디코딩 (수신 스레드에서 수행해 UI 스레드 부하 방지)
+			frame->width = (width + kDecodeReduce - 1) / kDecodeReduce;
+			frame->height = (height + kDecodeReduce - 1) / kDecodeReduce;
+			frame->strideBytes = (frame->width + 3) & ~3u;
+
 			auto decodeBegin = std::chrono::steady_clock::now();
-			if (!decodeJpegToGray(raw.data(), payloadBytes, width, height,
+			if (!decodeJpegToGray(raw.data(), payloadBytes, frame->width, frame->height,
 				frame->strideBytes, frame->pixels))
 			{
 				msg.Format(_T("[Error] JPEG decode failed for frame #%llu (%u bytes). Skipping."), frameNumber, payloadBytes);
@@ -544,6 +577,9 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 		}
 		else
 		{
+			frame->width = width;
+			frame->height = height;
+			frame->strideBytes = (width + 3) & ~3u;
 			auto copyBegin = std::chrono::steady_clock::now();
 			frame->pixels.resize(static_cast<size_t>(frame->strideBytes) * height);
 			for (UINT32 y = 0; y < height; ++y)
@@ -582,6 +618,10 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 	}
 	delete frame;
 
+	// 새 프레임을 백버퍼에 1회 렌더링 (m_lastRenderMs가 이번 프레임 값으로 확정됨)
+	renderFrameToBackBuffer();
+	InvalidateRect(m_imageArea, FALSE);
+
 	++m_displayedFrames;
 
 	// warmup: flush 직후 첫 프레임은 파이프라인 겹침 없이 노출을 통째로 기다려
@@ -612,7 +652,7 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 
 	CString status;
 	status.Format(_T("Frame #%llu  %u x %u  |  %.1f fps  (displayed %llu)"),
-		m_frame.frameNumber, m_frame.width, m_frame.height, m_fps, m_displayedFrames);
+		m_frame.frameNumber, m_frame.nativeWidth, m_frame.nativeHeight, m_fps, m_displayedFrames);
 	m_statusText.SetWindowText(status);
 
 	// 수신 상세(바이트 수 등)는 그랩 시작 후 첫 프레임만 로그 — 이후 프레임은
@@ -621,10 +661,11 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 	{
 		m_logFirstFrame = false;
 		CString log;
-		log.Format(_T("[First frame #%llu] %s, header(84) + payload(%u) bytes, %u x %u"),
+		log.Format(_T("[First frame #%llu] %s, header(84) + payload(%u) bytes, %u x %u (display %u x %u)"),
 			m_frame.frameNumber,
 			(m_frame.format == kFormatJpeg) ? _T("JPEG") : _T("RAW"),
 			m_frame.payloadBytes,
+			m_frame.nativeWidth, m_frame.nativeHeight,
 			m_frame.width, m_frame.height);
 		m_logList.AddString(log);
 		m_logList.SetTopIndex(m_logList.GetCount() - 1);
@@ -648,8 +689,7 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 	}
 
 	updateTimingDisplay();
-
-	Invalidate(FALSE);
+	// (이미지 영역은 위에서 InvalidateRect로 갱신 요청됨 — 전체 Invalidate 불필요)
 	return 0;
 }
 
@@ -755,24 +795,6 @@ void CjetsonUIDlg::drawFrame(CDC& dc, const CRect& area)
 		return;
 	}
 
-	// 8bit grayscale DIB (팔레트 256단계)
-	struct
-	{
-		BITMAPINFOHEADER header;
-		RGBQUAD palette[256];
-	} bmi;
-	ZeroMemory(&bmi, sizeof(bmi));
-	bmi.header.biSize = sizeof(BITMAPINFOHEADER);
-	bmi.header.biWidth = static_cast<LONG>(m_frame.width);
-	bmi.header.biHeight = -static_cast<LONG>(m_frame.height);	// top-down
-	bmi.header.biPlanes = 1;
-	bmi.header.biBitCount = 8;
-	bmi.header.biCompression = BI_RGB;
-	for (int i = 0; i < 256; ++i)
-	{
-		bmi.palette[i].rgbRed = bmi.palette[i].rgbGreen = bmi.palette[i].rgbBlue = static_cast<BYTE>(i);
-	}
-
 	// 종횡비를 유지하며 영역에 맞춤
 	double scale = std::min(
 		static_cast<double>(area.Width()) / m_frame.width,
@@ -783,17 +805,84 @@ void CjetsonUIDlg::drawFrame(CDC& dc, const CRect& area)
 	int destY = area.top + (area.Height() - destH) / 2;
 
 	auto renderBegin = std::chrono::steady_clock::now();
+
+	// GDI HALFTONE 스트레치는 목적지 픽셀마다 CPU 보간이라 느리다(~10ms).
+	// 대신 OpenCV SIMD 리사이즈로 표시 크기를 만든 뒤 GDI에는 1:1 블릿만 시킨다.
+	const int scaledStride = (destW + 3) & ~3;
+	m_scaled.resize(static_cast<size_t>(scaledStride) * destH);
+	{
+		cv::Mat src(static_cast<int>(m_frame.height), static_cast<int>(m_frame.width), CV_8UC1,
+			const_cast<BYTE*>(m_frame.pixels.data()), static_cast<size_t>(m_frame.strideBytes));
+		cv::Mat dst(destH, destW, CV_8UC1, m_scaled.data(), static_cast<size_t>(scaledStride));
+		// 축소는 INTER_AREA(고품질), 확대는 INTER_LINEAR
+		cv::resize(src, dst, dst.size(), 0, 0,
+			(destW < static_cast<int>(m_frame.width)) ? cv::INTER_AREA : cv::INTER_LINEAR);
+	}
+
+	// 8bit grayscale DIB (팔레트 256단계), 1:1 블릿용
+	struct
+	{
+		BITMAPINFOHEADER header;
+		RGBQUAD palette[256];
+	} bmi;
+	ZeroMemory(&bmi, sizeof(bmi));
+	bmi.header.biSize = sizeof(BITMAPINFOHEADER);
+	bmi.header.biWidth = scaledStride;	// stride 단위 폭 (표시 폭은 destW로 클립)
+	bmi.header.biHeight = -destH;	// top-down
+	bmi.header.biPlanes = 1;
+	bmi.header.biBitCount = 8;
+	bmi.header.biCompression = BI_RGB;
+	for (int i = 0; i < 256; ++i)
+	{
+		bmi.palette[i].rgbRed = bmi.palette[i].rgbGreen = bmi.palette[i].rgbBlue = static_cast<BYTE>(i);
+	}
+
 	dc.FillSolidRect(area, RGB(30, 30, 30));
-	SetStretchBltMode(dc.GetSafeHdc(), HALFTONE);
-	SetBrushOrgEx(dc.GetSafeHdc(), 0, 0, nullptr);
 	StretchDIBits(dc.GetSafeHdc(),
 		destX, destY, destW, destH,
-		0, 0, m_frame.width, m_frame.height,
-		m_frame.pixels.data(),
+		0, 0, destW, destH,	// 소스=목적지 크기: 스케일링 없음
+		m_scaled.data(),
 		reinterpret_cast<const BITMAPINFO*>(&bmi),
 		DIB_RGB_COLORS, SRCCOPY);
 	GdiFlush();	// 배칭된 GDI 명령을 실행시켜 렌더링 시간을 실제에 가깝게 측정
 	m_lastRenderMs = elapsedMs(renderBegin);
+}
+
+// 더블 버퍼 렌더링: 프레임 수신(또는 영역 변경) 시 1회만 축소 렌더링을 수행하고,
+// OnPaint는 완성된 백버퍼를 BitBlt만 한다 -> 창 이벤트마다 5MP 재축소 방지 + 깜빡임 제거.
+void CjetsonUIDlg::renderFrameToBackBuffer()
+{
+	if (m_imageArea.Width() <= 0 || m_imageArea.Height() <= 0)
+	{
+		m_backValid = false;
+		return;
+	}
+
+	CClientDC dc(this);
+	if (m_backDC.GetSafeHdc() == nullptr)
+	{
+		m_backDC.CreateCompatibleDC(&dc);
+	}
+	if (m_backSize != m_imageArea.Size())
+	{
+		if (m_backOld != nullptr)
+		{
+			m_backDC.SelectObject(m_backOld);	// 기존 비트맵 선택 해제 후 삭제
+			m_backOld = nullptr;
+		}
+		m_backBmp.DeleteObject();
+		if (!m_backBmp.CreateCompatibleBitmap(&dc, m_imageArea.Width(), m_imageArea.Height()))
+		{
+			m_backValid = false;
+			return;
+		}
+		m_backOld = m_backDC.SelectObject(&m_backBmp);
+		m_backSize = m_imageArea.Size();
+	}
+
+	CRect local(0, 0, m_backSize.cx, m_backSize.cy);
+	drawFrame(m_backDC, local);	// 렌더 시간(m_lastRenderMs)도 여기서 측정됨
+	m_backValid = true;
 }
 
 // 대화 상자에 최소화 단추를 추가할 경우 아이콘을 그리려면
@@ -823,15 +912,16 @@ void CjetsonUIDlg::OnPaint()
 	{
 		CPaintDC dc(this);
 
-		CRect client;
-		GetClientRect(&client);
-		// 이미지 영역: 툴바 아래 왼쪽 (오른쪽 열은 파이프라인 + 로그)
-		CRect imageArea(client.left, client.top + kToolbarHeight,
-			client.left + sideColumnLeft(client.Width()), client.bottom);
-		drawFrame(dc, imageArea);
-
-		// 렌더링 시간이 확정된 후 파이프라인 표시 갱신
-		updateTimingDisplay();
+		// 완성된 백버퍼를 복사만 한다 (재축소 없음, 깜빡임 없음)
+		if (m_backValid)
+		{
+			dc.BitBlt(m_imageArea.left, m_imageArea.top, m_backSize.cx, m_backSize.cy,
+				&m_backDC, 0, 0, SRCCOPY);
+		}
+		else
+		{
+			dc.FillSolidRect(m_imageArea, RGB(30, 30, 30));
+		}
 	}
 }
 

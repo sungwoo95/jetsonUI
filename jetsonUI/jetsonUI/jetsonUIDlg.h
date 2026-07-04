@@ -13,8 +13,10 @@
 // 젯슨에서 수신한 한 프레임 (8bit grayscale, 행은 4바이트 정렬)
 struct ReceivedFrame
 {
-	UINT32 width = 0;
+	UINT32 width = 0;        // 픽셀 버퍼(디코드 결과) 크기 — 축소 디코드 시 원본의 1/2
 	UINT32 height = 0;
+	UINT32 nativeWidth = 0;  // 센서 원본 해상도 (헤더 값, 상태 표시용)
+	UINT32 nativeHeight = 0;
 	UINT64 frameNumber = 0;
 	int strideBytes = 0;
 	std::vector<BYTE> pixels;
@@ -107,6 +109,17 @@ protected:
 	// 마지막 렌더링(StretchDIBits) 소요 시간 (UI 스레드에서만 접근)
 	double m_lastRenderMs = 0.0;
 
+	// 표시 크기로 리사이즈된 프레임 버퍼 (drawFrame에서 재사용)
+	std::vector<BYTE> m_scaled;
+
+	// 더블 버퍼: 프레임 수신 시 1회만 축소 렌더링하고 OnPaint는 BitBlt만 수행
+	CDC m_backDC;
+	CBitmap m_backBmp;
+	CBitmap* m_backOld = nullptr;
+	CSize m_backSize{ 0, 0 };
+	bool m_backValid = false;
+	CRect m_imageArea{ 0, 0, 0, 0 };	// 레이아웃이 정한 이미지 표시 영역
+
 	// 수신 스레드 상태
 	std::thread m_recvThread;
 	std::atomic<SOCKET> m_socket{ INVALID_SOCKET };
@@ -128,6 +141,7 @@ protected:
 	void postLog(const CString& text);
 	void joinReceiveThread();
 	void drawFrame(CDC& dc, const CRect& area);
+	void renderFrameToBackBuffer();
 	void updateTimingDisplay();
 	void layoutControls();
 
