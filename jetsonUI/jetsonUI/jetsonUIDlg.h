@@ -121,6 +121,7 @@ protected:
 	bool m_haveFrameTime = false;
 	double m_fps = 0.0;
 	UINT64 m_displayedFrames = 0;
+	int m_warmupRemaining = 0;	// 그랩 시작 후 남은 warmup 프레임 수 (측정 제외)
 
 	void receiveLoop(CStringA host, int port);
 	void postStatus(const CString& text);
