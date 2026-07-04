@@ -26,6 +26,8 @@ struct ReceivedFrame
 	double cudaMs = 0.0;        // CUDA 커널 (ms)
 	double d2hMs = 0.0;         // Device -> Host 복사 (ms)
 	double totalMs = 0.0;       // GPU 파이프라인 전체 (ms)
+	double stageCopyMs = 0.0;   // 입력 스테이징 복사: 카메라 버퍼 -> pinned (ms)
+	double outCopyMs = 0.0;     // 출력 복사: pinned -> 결과 버퍼 (ms)
 	UINT32 format = 0;          // 0=Raw8, 1=Jpeg
 	double encodeMs = 0.0;      // 젯슨 JPEG 인코딩 (ms)
 	UINT32 payloadBytes = 0;    // 실제 전송된 페이로드 크기
@@ -100,8 +102,11 @@ protected:
 	CFont m_monoFont;			// 파이프라인 표 정렬용 고정폭 폰트
 
 	// 파이프라인 단계 인덱스 (현재값/이동평균 공용). FPS는 단일 평활값이라 제외.
-	enum { PS_CAPTURE, PS_H2D, PS_CUDA, PS_D2H, PS_ENCODE,
-		PS_TRANSFER, PS_DECODE, PS_RENDER, PS_E2E, PS_COUNT };
+	// PS_INCOPY/PS_OUTCOPY: GPU 파이프라인 내부의 입력/출력 CPU 복사.
+	// PS_GPUOTHER: GPU total에서 위 단계들을 뺀 잔여(submit/sync 등, ~0.5ms)
+	// -> 표 합계가 E2E와 맞도록 유지.
+	enum { PS_CAPTURE, PS_INCOPY, PS_H2D, PS_CUDA, PS_D2H, PS_OUTCOPY,
+		PS_GPUOTHER, PS_ENCODE, PS_TRANSFER, PS_DECODE, PS_RENDER, PS_E2E, PS_COUNT };
 	RollingMean m_avg[PS_COUNT];	// 단계별 최근 N프레임 이동평균
 
 	// 마지막 렌더링(StretchDIBits) 소요 시간 (UI 스레드에서만 접근)

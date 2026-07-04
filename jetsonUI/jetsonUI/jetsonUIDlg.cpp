@@ -17,12 +17,13 @@
 
 namespace
 {
-	// 젯슨 tcp_server.cpp::sendFrame 프로토콜과 동일 (little-endian, 84바이트)
+	// 젯슨 tcp_server.cpp::sendFrame 프로토콜과 동일 (little-endian, 100바이트)
 	// [uint32 width][uint32 height][uint64 frameNumber][uint32 payloadBytes]
 	// [uint64 captureUs][uint64 serviceTotalUs]
 	// [double h2dMs][double cudaMs][double d2hMs][double totalMs]
 	// [uint32 format][uint32 reserved][double encodeMs]
-	constexpr int kHeaderBytes = 84;
+	// [double stageMs][double outputCopyMs]
+	constexpr int kHeaderBytes = 100;
 	constexpr UINT32 kMaxPayloadBytes = 100 * 1024 * 1024;
 	constexpr UINT32 kFormatRaw8 = 0;
 	constexpr UINT32 kFormatJpeg = 1;
@@ -318,9 +319,9 @@ void CjetsonUIDlg::layoutControls()
 	int width = cx - left - 5;
 	int columnH = cy - top - 5;
 
-	// 파이프라인 표는 12행(헤더+9단계+구분선+FPS). 오른쪽 열 높이에 비례해
-	// 폰트를 키우고, 상자 높이를 정확히 12행에 맞춰 빈 공간이 없게 한다.
-	const int kRows = 12;
+	// 파이프라인 표는 15행(헤더+12단계+구분선+FPS). 오른쪽 열 높이에 비례해
+	// 폰트를 키우고, 상자 높이를 정확히 15행에 맞춰 빈 공간이 없게 한다.
+	const int kRows = 15;
 	int targetRow = std::min(38, std::max(20, columnH / 22));	// 열이 클수록 행도 큼(캡 38px)
 	int fontPx = targetRow - 4;
 
@@ -501,7 +502,7 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 
 		UINT32 width, height, payloadBytes, format;
 		UINT64 frameNumber, captureUs, serviceTotalUs;
-		double h2dMs, cudaMs, d2hMs, totalMs, encodeMs;
+		double h2dMs, cudaMs, d2hMs, totalMs, encodeMs, stageMs, outputCopyMs;
 		memcpy(&width, header + 0, 4);
 		memcpy(&height, header + 4, 4);
 		memcpy(&frameNumber, header + 8, 8);
@@ -514,6 +515,8 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 		memcpy(&totalMs, header + 60, 8);
 		memcpy(&format, header + 68, 4);
 		memcpy(&encodeMs, header + 76, 8);
+		memcpy(&stageMs, header + 84, 8);
+		memcpy(&outputCopyMs, header + 92, 8);
 
 		bool validPayload = (format == kFormatRaw8)
 			? (payloadBytes == width * height)
@@ -548,6 +551,8 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 		frame->cudaMs = cudaMs;
 		frame->d2hMs = d2hMs;
 		frame->totalMs = totalMs;
+		frame->stageCopyMs = stageMs;
+		frame->outCopyMs = outputCopyMs;
 		frame->format = format;
 		frame->encodeMs = (format == kFormatJpeg) ? encodeMs : 0.0;
 		frame->payloadBytes = payloadBytes;
@@ -666,9 +671,13 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 		double e2e = m_frame.serviceTotalUs / 1000.0 + m_frame.encodeMs
 			+ m_frame.transferMs + m_frame.decodeMs + m_frame.copyMs + m_lastRenderMs;
 		m_avg[PS_CAPTURE].add(m_frame.captureUs / 1000.0);
+		m_avg[PS_INCOPY].add(m_frame.stageCopyMs);
 		m_avg[PS_H2D].add(m_frame.h2dMs);
 		m_avg[PS_CUDA].add(m_frame.cudaMs);
 		m_avg[PS_D2H].add(m_frame.d2hMs);
+		m_avg[PS_OUTCOPY].add(m_frame.outCopyMs);
+		m_avg[PS_GPUOTHER].add(std::max(0.0, m_frame.totalMs - m_frame.stageCopyMs - m_frame.h2dMs
+			- m_frame.cudaMs - m_frame.d2hMs - m_frame.outCopyMs));
 		m_avg[PS_ENCODE].add(m_frame.encodeMs);
 		m_avg[PS_TRANSFER].add(m_frame.transferMs);
 		m_avg[PS_DECODE].add(m_frame.decodeMs);
@@ -694,13 +703,21 @@ void CjetsonUIDlg::updateTimingDisplay()
 	double e2eNow = m_frame.serviceTotalUs / 1000.0 + m_frame.encodeMs
 		+ m_frame.transferMs + m_frame.decodeMs + m_frame.copyMs + m_lastRenderMs;
 
-	// 3열 표: 단계 / 현재 프레임(now) / 최근 N프레임 이동평균(avg)
+	// GPU Etc: GPU total에서 개별 표시 단계들을 뺀 잔여 (submit/sync 등, ~0.5ms).
+	// 이 행 덕분에 표시 단계의 합이 E2E와 일치한다.
+	double gpuOtherNow = std::max(0.0, m_frame.totalMs - m_frame.stageCopyMs - m_frame.h2dMs
+		- m_frame.cudaMs - m_frame.d2hMs - m_frame.outCopyMs);
+
+	// 3열 표: 단계 / 현재 프레임(now) / 최근 N프레임 이동평균(avg). 실행 순서대로.
 	struct Row { const TCHAR* label; double now; int stage; };
 	Row rows[] = {
 		{ _T("Capture"),  m_frame.captureUs / 1000.0, PS_CAPTURE },
+		{ _T("InCopy"),   m_frame.stageCopyMs,        PS_INCOPY },
 		{ _T("H2D"),      m_frame.h2dMs,              PS_H2D },
 		{ _T("CUDA"),     m_frame.cudaMs,             PS_CUDA },
 		{ _T("D2H"),      m_frame.d2hMs,              PS_D2H },
+		{ _T("OutCopy"),  m_frame.outCopyMs,          PS_OUTCOPY },
+		{ _T("GPU Etc"),  gpuOtherNow,                PS_GPUOTHER },
 		{ _T("Encode"),   m_frame.encodeMs,           PS_ENCODE },
 		{ _T("Transfer"), m_frame.transferMs,         PS_TRANSFER },
 		{ _T("Decode"),   m_frame.decodeMs,           PS_DECODE },
