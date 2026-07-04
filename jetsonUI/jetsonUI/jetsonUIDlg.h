@@ -93,6 +93,7 @@ protected:
 	CButton m_connectButton;	// Connect <-> Disconnect 토글
 	CButton m_grabButton;		// Start Grab <-> Stop Grab 토글 (연결 중에만 활성)
 	bool m_grabbing = false;
+	bool m_logFirstFrame = false;	// 그랩 시작 후 첫 프레임의 수신 상세를 1회 로그
 	CStatic m_statusText;
 	CListBox m_logList;
 	CListBox m_pipelineList;	// 이미지 오른쪽: 파이프라인 단계별 시간 (현재/평균)
@@ -127,6 +128,7 @@ protected:
 	void joinReceiveThread();
 	void drawFrame(CDC& dc, const CRect& area);
 	void updateTimingDisplay();
+	void layoutControls();
 
 	virtual void OnOK() {}	// Enter 키로 대화 상자가 닫히지 않도록 함
 

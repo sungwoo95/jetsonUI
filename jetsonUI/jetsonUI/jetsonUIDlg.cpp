@@ -39,7 +39,6 @@ namespace
 
 	// 오른쪽 정보 열(파이프라인 + 로그) 레이아웃
 	constexpr int kSideColumnMinWidth = 230;
-	constexpr int kPipelineHeight = 275;	// 파이프라인 리스트 높이 (헤더+9단계+구분+FPS = 12행)
 
 	// 오른쪽 열의 시작 x 좌표 (이미지와 정보 열의 경계)
 	int sideColumnLeft(int clientWidth)
@@ -217,7 +216,8 @@ BOOL CjetsonUIDlg::OnInitDialog()
 
 	// 파이프라인 리스트박스 (이미지 오른쪽 상단, 위치는 OnSize에서 결정)
 	// 현재/평균 열 정렬을 위해 고정폭 폰트 사용
-	m_monoFont.CreatePointFont(90, _T("Consolas"));
+	// 파이프라인 표: 고정폭 폰트. 실제 크기는 layoutControls에서 영역에 맞춰 재생성.
+	m_monoFont.CreatePointFont(110, _T("Consolas"));
 	m_pipelineList.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
 		CRect(0, 0, 0, 0), this, IDC_PIPELINE_LIST);
 	m_pipelineList.SetFont(&m_monoFont);
@@ -228,6 +228,18 @@ BOOL CjetsonUIDlg::OnInitDialog()
 		CRect(0, 0, 0, 0), this, IDC_LOG_LIST);
 	m_logList.SetFont(font);
 	m_logList.AddString(_T("[System] Initialized."));
+
+	// 초기 창 크기: 작업 영역 안에서 1500x950으로 확대 후 중앙 배치.
+	// 이어서 레이아웃을 즉시 적용해 창을 늘리기 전에도 빈 공간이 없도록 한다.
+	CRect work;
+	SystemParametersInfo(SPI_GETWORKAREA, 0, &work, 0);
+	int w = std::min(1500, static_cast<int>(work.Width()) - 60);
+	int h = std::min(950, static_cast<int>(work.Height()) - 60);
+	SetWindowPos(nullptr,
+		work.left + (work.Width() - w) / 2,
+		work.top + (work.Height() - h) / 2,
+		w, h, SWP_NOZORDER);
+	layoutControls();
 
 	return TRUE;  // 포커스를 컨트롤에 설정하지 않으면 TRUE를 반환합니다.
 }
@@ -262,20 +274,54 @@ void CjetsonUIDlg::OnDestroy()
 void CjetsonUIDlg::OnSize(UINT nType, int cx, int cy)
 {
 	CDialogEx::OnSize(nType, cx, cy);
+	layoutControls();
+	Invalidate();
+}
 
-	// 레이아웃: 이미지(왼쪽) | 오른쪽 열 = 파이프라인(위) + 로그(아래)
-	if (m_logList.GetSafeHwnd() != nullptr && m_pipelineList.GetSafeHwnd() != nullptr
-		&& cy > kToolbarHeight + 100)
+// 레이아웃: 이미지(왼쪽) | 오른쪽 열 = 파이프라인(위 40%) + 로그(아래 나머지)
+// OnSize와 OnInitDialog(초기 배치) 양쪽에서 호출된다.
+void CjetsonUIDlg::layoutControls()
+{
+	if (m_logList.GetSafeHwnd() == nullptr || m_pipelineList.GetSafeHwnd() == nullptr)
 	{
-		int left = sideColumnLeft(cx) + 5;
-		int top = kToolbarHeight + 5;
-		int pipelineBottom = std::min(top + kPipelineHeight, cy - 40);
-
-		m_pipelineList.SetWindowPos(nullptr, left, top, cx - left - 5, pipelineBottom - top, SWP_NOZORDER);
-		m_logList.SetWindowPos(nullptr, left, pipelineBottom + 5, cx - left - 5, cy - pipelineBottom - 10, SWP_NOZORDER);
+		return;
 	}
 
-	Invalidate();
+	CRect client;
+	GetClientRect(&client);
+	const int cx = client.Width();
+	const int cy = client.Height();
+	if (cy <= kToolbarHeight + 100)
+	{
+		return;
+	}
+
+	int left = sideColumnLeft(cx) + 5;
+	int top = kToolbarHeight + 5;
+	int width = cx - left - 5;
+	int columnH = cy - top - 5;
+
+	// 파이프라인 표는 12행(헤더+9단계+구분선+FPS). 오른쪽 열 높이에 비례해
+	// 폰트를 키우고, 상자 높이를 정확히 12행에 맞춰 빈 공간이 없게 한다.
+	const int kRows = 12;
+	int targetRow = std::min(38, std::max(20, columnH / 22));	// 열이 클수록 행도 큼(캡 38px)
+	int fontPx = targetRow - 4;
+
+	// 폰트 재생성 (선택 해제 후 삭제해야 GDI 안전)
+	m_pipelineList.SetFont(nullptr);
+	m_monoFont.DeleteObject();
+	m_monoFont.CreateFont(-fontPx, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+		DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, _T("Consolas"));
+	m_pipelineList.SetFont(&m_monoFont);
+
+	// 폰트 적용 후 실제 행 높이로 상자 높이를 산정 -> 12행이 상자를 정확히 채움
+	int rowH = m_pipelineList.GetItemHeight(0);
+	int pipelineH = kRows * rowH + 6;
+	pipelineH = std::min(pipelineH, columnH - 60);	// 로그 최소 공간 확보
+
+	m_pipelineList.SetWindowPos(nullptr, left, top, width, pipelineH, SWP_NOZORDER);
+	m_logList.SetWindowPos(nullptr, left, top + pipelineH + 5, width, columnH - pipelineH - 5, SWP_NOZORDER);
 }
 
 void CjetsonUIDlg::joinReceiveThread()
@@ -345,6 +391,10 @@ void CjetsonUIDlg::OnBnClickedGrab()
 	}
 
 	m_grabbing = !m_grabbing;
+	if (m_grabbing)
+	{
+		m_logFirstFrame = true;	// 이번 그랩의 첫 프레임 수신 상세를 1회 로그
+	}
 	m_grabButton.SetWindowText(m_grabbing ? _T("Stop Grab") : _T("Start Grab"));
 	m_logList.AddString(m_grabbing ? _T("[System] Grab start requested.") : _T("[System] Grab stop requested."));
 	m_logList.SetTopIndex(m_logList.GetCount() - 1);
@@ -441,12 +491,6 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 			break;
 		}
 
-		// 헤더 수신 로그
-		UINT32 totalRecvBytes = kHeaderBytes + payloadBytes;
-		msg.Format(_T("[Frame #%llu] Header received: %u x %u, expecting %u bytes (header: %d)"),
-			frameNumber, width, height, payloadBytes, kHeaderBytes);
-		postLog(msg);
-
 		// 픽셀 데이터 수신 (소요 시간 = 네트워크 전송 시간 근사치)
 		std::vector<BYTE> raw(payloadBytes);
 		auto transferBegin = std::chrono::steady_clock::now();
@@ -457,11 +501,6 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 			break;
 		}
 		double transferMs = elapsedMs(transferBegin);
-
-		// 수신 완료 로그
-		msg.Format(_T("[Frame #%llu] Received: header(%d) + pixels(%u) = total %u bytes"),
-			frameNumber, kHeaderBytes, payloadBytes, totalRecvBytes);
-		postLog(msg);
 
 		auto* frame = new ReceivedFrame();
 		frame->width = width;
@@ -553,20 +592,20 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 		m_frame.frameNumber, m_frame.width, m_frame.height, m_fps, m_displayedFrames);
 	m_statusText.SetWindowText(status);
 
-	// 프레임별 타이밍 로그 (스트리밍 시 무한 증가 방지: 최근 200개만 유지)
-	CString log;
-	log.Format(_T("[#%llu] %s %u bytes | cap=%.1f enc=%.1f xfer=%.1f dec=%.1f | %.1ffps"),
-		m_frame.frameNumber,
-		(m_frame.format == kFormatJpeg) ? _T("JPEG") : _T("RAW"),
-		m_frame.payloadBytes,
-		m_frame.captureUs / 1000.0,
-		m_frame.encodeMs, m_frame.transferMs, m_frame.decodeMs, m_fps);
-	m_logList.AddString(log);
-	while (m_logList.GetCount() > 200)
+	// 수신 상세(바이트 수 등)는 그랩 시작 후 첫 프레임만 로그 — 이후 프레임은
+	// 상태줄/파이프라인 표가 실시간으로 보여주므로 로그 범람 방지
+	if (m_logFirstFrame)
 	{
-		m_logList.DeleteString(0);
+		m_logFirstFrame = false;
+		CString log;
+		log.Format(_T("[First frame #%llu] %s, header(84) + payload(%u) bytes, %u x %u"),
+			m_frame.frameNumber,
+			(m_frame.format == kFormatJpeg) ? _T("JPEG") : _T("RAW"),
+			m_frame.payloadBytes,
+			m_frame.width, m_frame.height);
+		m_logList.AddString(log);
+		m_logList.SetTopIndex(m_logList.GetCount() - 1);
 	}
-	m_logList.SetTopIndex(m_logList.GetCount() - 1);
 
 	// 이동평균 갱신 (프레임당 1회. Render는 직전 프레임 값이라 1프레임 지연 — 무시 가능)
 	double e2e = m_frame.serviceTotalUs / 1000.0 + m_frame.encodeMs
