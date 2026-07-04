@@ -13,10 +13,8 @@
 // 젯슨에서 수신한 한 프레임 (8bit grayscale, 행은 4바이트 정렬)
 struct ReceivedFrame
 {
-	UINT32 width = 0;        // 픽셀 버퍼(디코드 결과) 크기 — 축소 디코드 시 원본의 1/2
+	UINT32 width = 0;
 	UINT32 height = 0;
-	UINT32 nativeWidth = 0;  // 센서 원본 해상도 (헤더 값, 상태 표시용)
-	UINT32 nativeHeight = 0;
 	UINT64 frameNumber = 0;
 	int strideBytes = 0;
 	std::vector<BYTE> pixels;

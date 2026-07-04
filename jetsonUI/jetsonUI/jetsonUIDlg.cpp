@@ -68,14 +68,9 @@ namespace
 		return true;
 	}
 
-	// 축소 디코드 배율: 표시 영역(~1000px)이 원본(2472px)보다 작으므로
-	// JPEG 디코드 단계에서 1/2로 축소해 디코드·렌더 비용을 동시에 줄인다.
-	constexpr int kDecodeReduce = 2;
-
-	// JPEG을 8bit grayscale(행 4바이트 정렬) 버퍼로 1/2 축소 디코딩.
+	// JPEG을 8bit grayscale(행 4바이트 정렬) 버퍼로 원본 해상도 디코딩.
 	// out 버퍼를 Mat으로 감싸 imdecode가 직접 그 메모리에 쓰게 하여(dst 재사용)
 	// 매 프레임 Mat 할당과 행 단위 stride 복사를 제거한다.
-	// width/height: 축소 후 기대 크기.
 	bool decodeJpegToGray(const BYTE* data, UINT32 bytes, UINT32 width, UINT32 height,
 		int strideBytes, std::vector<BYTE>& out)
 	{
@@ -86,7 +81,7 @@ namespace
 		// out 메모리를 그대로 목적지로 사용 (크기/타입이 일치하면 재할당 없이 직접 기록)
 		cv::Mat dst(static_cast<int>(height), static_cast<int>(width), CV_8UC1,
 			out.data(), static_cast<size_t>(strideBytes));
-		cv::Mat res = cv::imdecode(encoded, cv::IMREAD_REDUCED_GRAYSCALE_2, &dst);
+		cv::Mat res = cv::imdecode(encoded, cv::IMREAD_GRAYSCALE, &dst);
 		if (res.empty() || res.cols != static_cast<int>(width) || res.rows != static_cast<int>(height))
 		{
 			return false;
@@ -543,8 +538,9 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 		double transferMs = elapsedMs(transferBegin);
 
 		auto* frame = new ReceivedFrame();
-		frame->nativeWidth = width;
-		frame->nativeHeight = height;
+		frame->width = width;
+		frame->height = height;
+		frame->strideBytes = (width + 3) & ~3u;
 		frame->frameNumber = frameNumber;
 		frame->captureUs = captureUs;
 		frame->serviceTotalUs = serviceTotalUs;
@@ -559,11 +555,7 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 
 		if (format == kFormatJpeg)
 		{
-			// 1/2 축소 디코딩 (수신 스레드에서 수행해 UI 스레드 부하 방지)
-			frame->width = (width + kDecodeReduce - 1) / kDecodeReduce;
-			frame->height = (height + kDecodeReduce - 1) / kDecodeReduce;
-			frame->strideBytes = (frame->width + 3) & ~3u;
-
+			// JPEG 디코딩 (수신 스레드에서 수행해 UI 스레드 부하 방지)
 			auto decodeBegin = std::chrono::steady_clock::now();
 			if (!decodeJpegToGray(raw.data(), payloadBytes, frame->width, frame->height,
 				frame->strideBytes, frame->pixels))
@@ -577,9 +569,6 @@ void CjetsonUIDlg::receiveLoop(CStringA host, int port)
 		}
 		else
 		{
-			frame->width = width;
-			frame->height = height;
-			frame->strideBytes = (width + 3) & ~3u;
 			auto copyBegin = std::chrono::steady_clock::now();
 			frame->pixels.resize(static_cast<size_t>(frame->strideBytes) * height);
 			for (UINT32 y = 0; y < height; ++y)
@@ -652,7 +641,7 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 
 	CString status;
 	status.Format(_T("Frame #%llu  %u x %u  |  %.1f fps  (displayed %llu)"),
-		m_frame.frameNumber, m_frame.nativeWidth, m_frame.nativeHeight, m_fps, m_displayedFrames);
+		m_frame.frameNumber, m_frame.width, m_frame.height, m_fps, m_displayedFrames);
 	m_statusText.SetWindowText(status);
 
 	// 수신 상세(바이트 수 등)는 그랩 시작 후 첫 프레임만 로그 — 이후 프레임은
@@ -661,11 +650,10 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 	{
 		m_logFirstFrame = false;
 		CString log;
-		log.Format(_T("[First frame #%llu] %s, header(84) + payload(%u) bytes, %u x %u (display %u x %u)"),
+		log.Format(_T("[First frame #%llu] %s, header(84) + payload(%u) bytes, %u x %u"),
 			m_frame.frameNumber,
 			(m_frame.format == kFormatJpeg) ? _T("JPEG") : _T("RAW"),
 			m_frame.payloadBytes,
-			m_frame.nativeWidth, m_frame.nativeHeight,
 			m_frame.width, m_frame.height);
 		m_logList.AddString(log);
 		m_logList.SetTopIndex(m_logList.GetCount() - 1);
