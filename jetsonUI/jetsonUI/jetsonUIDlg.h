@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <afxcmn.h>		// CListCtrl (파이프라인 시간 표)
+
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -98,8 +100,8 @@ protected:
 	bool m_logFirstFrame = false;	// 그랩 시작 후 첫 프레임의 수신 상세를 1회 로그
 	CStatic m_statusText;
 	CListBox m_logList;
-	CListBox m_pipelineList;	// 이미지 오른쪽: 파이프라인 단계별 시간 (현재/평균)
-	CFont m_monoFont;			// 파이프라인 표 정렬용 고정폭 폰트
+	CListCtrl m_pipelineList;	// 이미지 오른쪽: 파이프라인 단계별 시간 표 (Stage/now/avg, 단위는 열 헤더)
+	CFont m_monoFont;			// 파이프라인 표 숫자 정렬용 고정폭 폰트
 
 	// 파이프라인 단계 인덱스 (현재값/이동평균 공용). FPS는 단일 평활값이라 제외.
 	// PS_INCOPY/PS_OUTCOPY: GPU 파이프라인 내부의 입력/출력 CPU 복사.

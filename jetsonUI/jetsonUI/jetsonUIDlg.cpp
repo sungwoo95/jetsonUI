@@ -225,14 +225,26 @@ BOOL CjetsonUIDlg::OnInitDialog()
 		CRect(442, 8, 1200, 33), this, IDC_STATUS_TEXT);
 	m_statusText.SetFont(font);
 
-	// 파이프라인 리스트박스 (이미지 오른쪽 상단, 위치는 OnSize에서 결정)
-	// 현재/평균 열 정렬을 위해 고정폭 폰트 사용
-	// 파이프라인 표: 고정폭 폰트. 실제 크기는 layoutControls에서 영역에 맞춰 재생성.
+	// 파이프라인 표 (이미지 오른쪽 상단, 위치는 OnSize에서 결정)
+	// 리포트 뷰 3열 표: Stage / now / avg. 단위(ms)는 열 헤더에 표시.
+	// 행은 여기서 1회 삽입하고 이후에는 값 셀만 갱신한다.
 	m_monoFont.CreatePointFont(110, _T("Consolas"));
-	m_pipelineList.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
+	m_pipelineList.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER,
 		CRect(0, 0, 0, 0), this, IDC_PIPELINE_LIST);
+	m_pipelineList.SetExtendedStyle(LVS_EX_GRIDLINES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
 	m_pipelineList.SetFont(&m_monoFont);
-	m_pipelineList.AddString(_T("Pipeline: (no frame yet)"));
+	m_pipelineList.InsertColumn(0, _T("Stage"), LVCFMT_LEFT, 120);
+	m_pipelineList.InsertColumn(1, _T("now(ms)"), LVCFMT_RIGHT, 90);
+	m_pipelineList.InsertColumn(2, _T("avg(ms)"), LVCFMT_RIGHT, 90);
+	static const TCHAR* kStageLabels[] = { _T("Capture"), _T("InCopy"), _T("H2D"), _T("CUDA"),
+		_T("D2H"), _T("OutCopy"), _T("GPU Etc"), _T("Encode"), _T("Transfer"), _T("Decode"),
+		_T("Render"), _T("E2E"), _T("FPS") };
+	for (int i = 0; i < _countof(kStageLabels); ++i)
+	{
+		m_pipelineList.InsertItem(i, kStageLabels[i]);
+		m_pipelineList.SetItemText(i, 1, _T("-"));
+		m_pipelineList.SetItemText(i, 2, _T("-"));
+	}
 
 	// 로그 리스트박스 (파이프라인 아래, 위치는 OnSize에서 결정)
 	m_logList.Create(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
@@ -319,9 +331,9 @@ void CjetsonUIDlg::layoutControls()
 	int width = cx - left - 5;
 	int columnH = cy - top - 5;
 
-	// 파이프라인 표는 15행(헤더+12단계+구분선+FPS). 오른쪽 열 높이에 비례해
-	// 폰트를 키우고, 상자 높이를 정확히 15행에 맞춰 빈 공간이 없게 한다.
-	const int kRows = 15;
+	// 파이프라인 표는 열 헤더 + 13행(12단계 + FPS). 오른쪽 열 높이에 비례해
+	// 폰트를 키우고, 상자 높이를 행 수에 맞춰 빈 공간이 없게 한다.
+	const int kItemRows = 13;
 	int targetRow = std::min(38, std::max(20, columnH / 22));	// 열이 클수록 행도 큼(캡 38px)
 	int fontPx = targetRow - 4;
 
@@ -333,12 +345,24 @@ void CjetsonUIDlg::layoutControls()
 		DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, _T("Consolas"));
 	m_pipelineList.SetFont(&m_monoFont);
 
-	// 폰트 적용 후 실제 행 높이로 상자 높이를 산정 -> 12행이 상자를 정확히 채움
-	int rowH = m_pipelineList.GetItemHeight(0);
-	int pipelineH = kRows * rowH + 6;
+	// 폰트 적용 후 실제 행/헤더 높이로 상자 높이를 산정 -> 13행이 상자를 정확히 채움
+	// (첫 행의 top = 열 헤더 높이)
+	int rowH = targetRow, headerH = targetRow;
+	CRect item0;
+	if (m_pipelineList.GetItemCount() > 0 && m_pipelineList.GetItemRect(0, &item0, LVIR_BOUNDS))
+	{
+		rowH = item0.Height();
+		headerH = item0.top;
+	}
+	int pipelineH = headerH + kItemRows * rowH + 6;
 	pipelineH = std::min(pipelineH, columnH - 60);	// 로그 최소 공간 확보
 
 	m_pipelineList.SetWindowPos(nullptr, left, top, width, pipelineH, SWP_NOZORDER);
+	// 열 폭: Stage 34%, now/avg 각 33% (헤더 "now(ms)"가 잘리지 않는 비율)
+	int inner = width - 6;
+	m_pipelineList.SetColumnWidth(0, inner * 34 / 100);
+	m_pipelineList.SetColumnWidth(1, inner * 33 / 100);
+	m_pipelineList.SetColumnWidth(2, inner * 33 / 100);
 	m_logList.SetWindowPos(nullptr, left, top + pipelineH + 5, width, columnH - pipelineH - 5, SWP_NOZORDER);
 
 	// 이미지 표시 영역 (왼쪽 열). 크기가 바뀌면 백버퍼를 다시 렌더링한다.
@@ -708,40 +732,35 @@ void CjetsonUIDlg::updateTimingDisplay()
 	double gpuOtherNow = std::max(0.0, m_frame.totalMs - m_frame.stageCopyMs - m_frame.h2dMs
 		- m_frame.cudaMs - m_frame.d2hMs - m_frame.outCopyMs);
 
-	// 3열 표: 단계 / 현재 프레임(now) / 최근 N프레임 이동평균(avg). 실행 순서대로.
-	struct Row { const TCHAR* label; double now; int stage; };
-	Row rows[] = {
-		{ _T("Capture"),  m_frame.captureUs / 1000.0, PS_CAPTURE },
-		{ _T("InCopy"),   m_frame.stageCopyMs,        PS_INCOPY },
-		{ _T("H2D"),      m_frame.h2dMs,              PS_H2D },
-		{ _T("CUDA"),     m_frame.cudaMs,             PS_CUDA },
-		{ _T("D2H"),      m_frame.d2hMs,              PS_D2H },
-		{ _T("OutCopy"),  m_frame.outCopyMs,          PS_OUTCOPY },
-		{ _T("GPU Etc"),  gpuOtherNow,                PS_GPUOTHER },
-		{ _T("Encode"),   m_frame.encodeMs,           PS_ENCODE },
-		{ _T("Transfer"), m_frame.transferMs,         PS_TRANSFER },
-		{ _T("Decode"),   m_frame.decodeMs,           PS_DECODE },
-		{ _T("Render"),   m_lastRenderMs,             PS_RENDER },
-		{ _T("E2E"),      e2eNow,                     PS_E2E },
+	// 표 갱신: 행(단계 라벨)은 OnInitDialog에서 1회 삽입 — 여기서는 값 셀만 갱신.
+	// 행 순서는 실행 순서이며 초기 삽입 순서와 일치해야 한다.
+	struct Row { double now; int stage; };
+	const Row rows[] = {
+		{ m_frame.captureUs / 1000.0, PS_CAPTURE },
+		{ m_frame.stageCopyMs,        PS_INCOPY },
+		{ m_frame.h2dMs,              PS_H2D },
+		{ m_frame.cudaMs,             PS_CUDA },
+		{ m_frame.d2hMs,              PS_D2H },
+		{ m_frame.outCopyMs,          PS_OUTCOPY },
+		{ gpuOtherNow,                PS_GPUOTHER },
+		{ m_frame.encodeMs,           PS_ENCODE },
+		{ m_frame.transferMs,         PS_TRANSFER },
+		{ m_frame.decodeMs,           PS_DECODE },
+		{ m_lastRenderMs,             PS_RENDER },
+		{ e2eNow,                     PS_E2E },
 	};
 
 	m_pipelineList.SetRedraw(FALSE);
-	m_pipelineList.ResetContent();
-
-	CString header;
-	header.Format(_T("%-8s %8s %8s"), _T("Stage"), _T("now"), _T("avg"));
-	m_pipelineList.AddString(header);
-
-	CString line;
-	for (const Row& r : rows)
+	CString cell;
+	for (int i = 0; i < _countof(rows); ++i)
 	{
-		line.Format(_T("%-8s %8.1f %8.1f"), r.label, r.now, m_avg[r.stage].mean());
-		m_pipelineList.AddString(line);
+		cell.Format(_T("%.1f"), rows[i].now);
+		m_pipelineList.SetItemText(i, 1, cell);
+		cell.Format(_T("%.1f"), m_avg[rows[i].stage].mean());
+		m_pipelineList.SetItemText(i, 2, cell);
 	}
-	m_pipelineList.AddString(_T("-------------------------"));
-	line.Format(_T("%-8s %8.1f"), _T("FPS"), m_fps);	// FPS는 평활된 단일 값
-	m_pipelineList.AddString(line);
-
+	cell.Format(_T("%.1f"), m_fps);	// FPS는 평활된 단일 값 (avg 셀은 비움)
+	m_pipelineList.SetItemText(_countof(rows), 1, cell);
 	m_pipelineList.SetRedraw(TRUE);
 	m_pipelineList.Invalidate();
 }
