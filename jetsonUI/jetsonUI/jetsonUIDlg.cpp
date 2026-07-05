@@ -664,8 +664,8 @@ LRESULT CjetsonUIDlg::OnFrameReceived(WPARAM /*wParam*/, LPARAM lParam)
 		m_logList.SetTopIndex(m_logList.GetCount() - 1);
 	}
 
-	// 이동평균 갱신 (warmup 프레임은 제외. 프레임당 1회. Render는 직전 프레임
-	// 값이라 1프레임 지연 — 무시 가능)
+	// 이동평균 갱신 (warmup 프레임은 제외. 프레임당 1회. Render는 위
+	// renderFrameToBackBuffer()에서 이번 프레임 값으로 이미 갱신됨)
 	if (!warmup)
 	{
 		double e2e = m_frame.serviceTotalUs / 1000.0 + m_frame.encodeMs
